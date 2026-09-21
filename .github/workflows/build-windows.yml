@@ -5,14 +5,32 @@ on:
   push:
     branches: [ main ]
 
+concurrency:
+  group: mycad-windows
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 180
+    timeout-minutes: 120
+
+    env:
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+      VCPKG_FEATURE_FLAGS: "manifests,binarycaching"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install prebuilt Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2022_64'
+          cache: true
+          set-env: true
 
       - name: Clone vcpkg
         shell: powershell
@@ -44,13 +62,9 @@ jobs:
             Get-ChildItem $bin -Filter "*.dll" | Copy-Item -Destination dist -Force
           }
 
-          $windeploy = Get-ChildItem $triplet -Filter "windeployqt.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-          if ($windeploy) {
-            & $windeploy --release --compiler-runtime --no-translations (Join-Path $PWD "dist\MyCAD.exe")
-            if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
-          } else {
-            throw "windeployqt.exe not found"
-          }
+          $windeploy = (Get-Command windeployqt.exe -ErrorAction Stop).Source
+          & $windeploy --release --compiler-runtime --no-translations (Join-Path $PWD "dist\MyCAD.exe")
+          if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
 
           Copy-Item README.md dist -Force
           Copy-Item THIRD_PARTY_NOTICES.md dist -Force
