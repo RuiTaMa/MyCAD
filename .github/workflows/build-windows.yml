@@ -46,31 +46,47 @@ jobs:
         shell: powershell
         run: cmake --build build --config Release --parallel 2
 
-      - name: Package
+      - name: Package portable runtime
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item build\Release\MyCAD.exe dist\MyCAD.exe -Force
 
-          $runtimeBin = Join-Path $env:CONDA_PREFIX "Library\bin"
+          $libraryRoot = Join-Path $env:CONDA_PREFIX "Library"
+          $runtimeBin = Join-Path $libraryRoot "bin"
+          $pluginRoot = Join-Path $libraryRoot "plugins"
+
           if (-not (Test-Path $runtimeBin)) {
             throw "Runtime bin directory not found: $runtimeBin"
           }
 
-          # Start with the conda runtime. This guarantees OCCT and the matching
-          # MSVC runtime are packaged together.
+          # Copy the complete native DLL set from the exact environment used
+          # for linking. This includes Qt, OCCT, TBB, FreeType, compression
+          # libraries and the Microsoft VC runtime.
           Get-ChildItem $runtimeBin -File -Filter "*.dll" |
             Copy-Item -Destination dist -Force
 
-          # Deploy Qt plugins from the same conda environment.
-          $windeploy = Join-Path $runtimeBin "windeployqt.exe"
-          if (-not (Test-Path $windeploy)) {
-            throw "windeployqt.exe not found: $windeploy"
-          }
+          # Qt searches for the Windows platform plugin at appdir/platforms.
+          # Copy plugin groups manually because conda's Qt package does not
+          # necessarily ship windeployqt.exe.
+          $pluginGroups = @(
+            "platforms",
+            "styles",
+            "imageformats",
+            "iconengines",
+            "generic",
+            "networkinformation",
+            "tls"
+          )
 
-          & $windeploy --release --no-translations (Join-Path $PWD "dist\MyCAD.exe")
-          if ($LASTEXITCODE -ne 0) {
-            throw "windeployqt failed"
+          foreach ($group in $pluginGroups) {
+            $source = Join-Path $pluginRoot $group
+            if (Test-Path $source) {
+              $destination = Join-Path $PWD "dist\$group"
+              Copy-Item $source $destination -Recurse -Force
+            }
           }
 
           $required = @(
@@ -93,17 +109,47 @@ jobs:
             }
           }
 
-          if (-not (Test-Path (Join-Path $PWD "dist\platforms\qwindows.dll"))) {
-            throw "Qt Windows platform plugin is missing."
+          $qwindows = Join-Path $PWD "dist\platforms\qwindows.dll"
+          if (-not (Test-Path $qwindows)) {
+            throw "Qt Windows platform plugin is missing: $qwindows"
           }
 
           Copy-Item README.md dist -Force
           Copy-Item THIRD_PARTY_NOTICES.md dist -Force
 
-          Write-Host "MyCAD package ready."
-          Write-Host "DLL count: $((Get-ChildItem dist -File -Filter '*.dll').Count)"
-          Write-Host "Package size:"
+          Write-Host "Portable package assembled."
+          Write-Host "Root DLL count: $((Get-ChildItem dist -File -Filter '*.dll').Count)"
+          Write-Host "Total package size:"
           "{0:N1} MB" -f ((Get-ChildItem dist -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: Inspect executable dependencies
+        shell: powershell
+        run: |
+          $dumpbin = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022" -Recurse -File -Filter "dumpbin.exe" |
+            Where-Object { $_.FullName -match "Hostx64\\x64" } |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if ($dumpbin) {
+            & $dumpbin /dependents dist\MyCAD.exe
+          } else {
+            Write-Host "dumpbin.exe not found; continuing to runtime smoke test."
+          }
+
+      - name: Smoke test MyCAD startup
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Join-Path $PWD "dist\MyCAD.exe"
+
+          $process = Start-Process -FilePath $exe -WorkingDirectory (Join-Path $PWD "dist") -PassThru
+          Start-Sleep -Seconds 8
+
+          if ($process.HasExited) {
+            throw "MyCAD exited during startup smoke test. Exit code: $($process.ExitCode)"
+          }
+
+          Write-Host "MyCAD remained running for 8 seconds. Startup smoke test passed."
+          Stop-Process -Id $process.Id -Force
 
       - name: Upload portable MyCAD
         uses: actions/upload-artifact@v4
