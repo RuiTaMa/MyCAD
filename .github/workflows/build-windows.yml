@@ -8,8 +8,56 @@ on:
 jobs:
   build:
     runs-on: windows-2022
+    timeout-minutes: 180
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Placeholder
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone vcpkg
         shell: powershell
-        run: Write-Host "MyCAD Windows build workflow connected."
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git .vcpkg
+          .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Configure
+        shell: powershell
+        run: |
+          cmake -S . -B build -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/.vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows
+
+      - name: Build
+        shell: powershell
+        run: cmake --build build --config Release --parallel 2
+
+      - name: Package
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build\Release\MyCAD.exe dist\MyCAD.exe -Force
+
+          $triplet = Join-Path $PWD "build\vcpkg_installed\x64-windows"
+          $bin = Join-Path $triplet "bin"
+
+          if (Test-Path $bin) {
+            Get-ChildItem $bin -Filter "*.dll" | Copy-Item -Destination dist -Force
+          }
+
+          $windeploy = Get-ChildItem $triplet -Filter "windeployqt.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          if ($windeploy) {
+            & $windeploy --release --compiler-runtime --no-translations (Join-Path $PWD "dist\MyCAD.exe")
+            if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
+          } else {
+            throw "windeployqt.exe not found"
+          }
+
+          Copy-Item README.md dist -Force
+          Copy-Item THIRD_PARTY_NOTICES.md dist -Force
+
+      - name: Upload portable MyCAD
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyCAD-Windows-x64
+          path: dist/
+          if-no-files-found: error
