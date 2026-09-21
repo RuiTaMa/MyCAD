@@ -1,12 +1,8 @@
 {
   "name": "mycad",
-  "version-string": "0.1.0",
+  "version-string": "0.1.1",
   "description": "Standalone Windows CAD application",
   "dependencies": [
-    {
-      "name": "qtbase",
-      "features": ["windeployqt"]
-    },
     {
       "name": "opencascade"
     }
