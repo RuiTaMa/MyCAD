@@ -12,26 +12,16 @@ concurrency:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install prebuilt Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: '6.8.3'
-          host: 'windows'
-          target: 'desktop'
-          arch: 'win64_msvc2022_64'
-          cache: true
-          set-env: true
-
-      - name: Install prebuilt OpenCASCADE
+      - name: Install prebuilt CAD runtime
         uses: mamba-org/setup-micromamba@v3
         with:
-          environment-name: mycad-occt
+          environment-name: mycad
           create-args: >-
             occt
           init-shell: powershell
@@ -39,34 +29,18 @@ jobs:
           cache-downloads: true
           post-cleanup: none
 
-      - name: Locate OpenCASCADE CMake config
-        id: occt
+      - name: Configure
         shell: powershell
         run: |
-          Write-Host "CONDA_PREFIX=$env:CONDA_PREFIX"
           if (-not $env:CONDA_PREFIX) {
             throw "CONDA_PREFIX is not set."
           }
 
-          $cfg = Get-ChildItem $env:CONDA_PREFIX -Recurse -File -Filter "OpenCASCADEConfig.cmake" |
-            Select-Object -First 1
+          $occtRoot = Join-Path $env:CONDA_PREFIX "Library"
+          Write-Host "OCCT_ROOT=$occtRoot"
 
-          if (-not $cfg) {
-            Write-Host "Searching for OCCT CMake config files..."
-            Get-ChildItem $env:CONDA_PREFIX -Recurse -File -Filter "*CASCADE*Config.cmake" |
-              ForEach-Object { Write-Host $_.FullName }
-            throw "OpenCASCADEConfig.cmake not found in micromamba environment."
-          }
-
-          $occtDir = $cfg.Directory.FullName
-          Write-Host "OpenCASCADE_DIR=$occtDir"
-          "dir=$occtDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      - name: Configure
-        shell: powershell
-        run: |
           cmake -S . -B build -A x64 `
-            -DOpenCASCADE_DIR="${{ steps.occt.outputs.dir }}"
+            -DOCCT_ROOT="$occtRoot"
 
       - name: Build
         shell: powershell
@@ -78,60 +52,58 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item build\Release\MyCAD.exe dist\MyCAD.exe -Force
 
-          # Copy OCCT and all native dependencies from the conda environment.
-          $condaBin = Join-Path $env:CONDA_PREFIX "Library\bin"
-          if (-not (Test-Path $condaBin)) {
-            throw "Conda runtime directory not found: $condaBin"
+          $runtimeBin = Join-Path $env:CONDA_PREFIX "Library\bin"
+          if (-not (Test-Path $runtimeBin)) {
+            throw "Runtime bin directory not found: $runtimeBin"
           }
-          Get-ChildItem $condaBin -File -Filter "*.dll" |
+
+          # Start with the conda runtime. This guarantees OCCT and the matching
+          # MSVC runtime are packaged together.
+          Get-ChildItem $runtimeBin -File -Filter "*.dll" |
             Copy-Item -Destination dist -Force
 
-          # Deploy Qt runtime and platform plugins.
-          $windeploy = (Get-Command windeployqt.exe -ErrorAction Stop).Source
+          # Deploy Qt plugins from the same conda environment.
+          $windeploy = Join-Path $runtimeBin "windeployqt.exe"
+          if (-not (Test-Path $windeploy)) {
+            throw "windeployqt.exe not found: $windeploy"
+          }
+
           & $windeploy --release --no-translations (Join-Path $PWD "dist\MyCAD.exe")
           if ($LASTEXITCODE -ne 0) {
             throw "windeployqt failed"
           }
 
-          # Validate the common MSVC runtime files. Conda's runtime package normally
-          # provides these; fall back to the Visual Studio installation if necessary.
-          $runtimeNames = @(
+          $required = @(
+            "Qt6Core.dll",
+            "Qt6Gui.dll",
+            "Qt6Widgets.dll",
+            "TKernel.dll",
+            "TKV3d.dll",
+            "TKOpenGl.dll",
+            "TKBRep.dll",
+            "TKDESTEP.dll",
             "msvcp140.dll",
             "vcruntime140.dll",
             "vcruntime140_1.dll"
           )
 
-          $missing = @($runtimeNames | Where-Object {
-            -not (Test-Path (Join-Path $PWD "dist\$_"))
-          })
-
-          if ($missing.Count -gt 0) {
-            Write-Host "Runtime DLLs missing after conda deployment: $($missing -join ', ')"
-            $vswhere = "$env:ProgramFiles(x86)\Microsoft Visual Studio\Installer\vswhere.exe"
-            if (Test-Path $vswhere) {
-              $vsPath = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
-              if ($vsPath) {
-                $redistRoot = Join-Path $vsPath "VC\Redist\MSVC"
-                if (Test-Path $redistRoot) {
-                  Get-ChildItem $redistRoot -Recurse -File -Filter "*.dll" |
-                    Where-Object { $_.FullName -match "\\x64\\Microsoft\.VC14[0-9]\.CRT\\" } |
-                    Copy-Item -Destination dist -Force
-                }
-              }
+          foreach ($file in $required) {
+            if (-not (Test-Path (Join-Path $PWD "dist\$file"))) {
+              throw "Required runtime file missing: $file"
             }
           }
 
-          foreach ($dll in $runtimeNames) {
-            if (-not (Test-Path (Join-Path $PWD "dist\$dll"))) {
-              throw "Required runtime DLL missing from package: $dll"
-            }
+          if (-not (Test-Path (Join-Path $PWD "dist\platforms\qwindows.dll"))) {
+            throw "Qt Windows platform plugin is missing."
           }
 
           Copy-Item README.md dist -Force
           Copy-Item THIRD_PARTY_NOTICES.md dist -Force
 
-          Write-Host "Packaged DLL count:"
-          (Get-ChildItem dist -File -Filter "*.dll").Count
+          Write-Host "MyCAD package ready."
+          Write-Host "DLL count: $((Get-ChildItem dist -File -Filter '*.dll').Count)"
+          Write-Host "Package size:"
+          "{0:N1} MB" -f ((Get-ChildItem dist -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
 
       - name: Upload portable MyCAD
         uses: actions/upload-artifact@v4
@@ -139,3 +111,4 @@ jobs:
           name: MyCAD-Windows-x64
           path: dist/
           if-no-files-found: error
+          compression-level: 6
