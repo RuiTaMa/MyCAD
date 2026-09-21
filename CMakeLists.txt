@@ -1,37 +1,59 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(MyCAD VERSION 0.1.0 LANGUAGES CXX)
+project(MyCAD VERSION 0.1.2 LANGUAGES CXX)
 
 if(NOT WIN32)
-  message(FATAL_ERROR "MyCAD V0.1 currently targets Windows x64.")
+  message(FATAL_ERROR "MyCAD currently targets Windows x64.")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 CONFIG REQUIRED COMPONENTS Widgets)
-find_package(OpenCASCADE CONFIG REQUIRED)
+if(NOT DEFINED OCCT_ROOT)
+  message(FATAL_ERROR "OCCT_ROOT must point to the conda Library directory.")
+endif()
 
-message(STATUS "OpenCASCADE ${OpenCASCADE_MAJOR_VERSION}.${OpenCASCADE_MINOR_VERSION}.${OpenCASCADE_MAINTENANCE_VERSION}")
-message(STATUS "OpenCASCADE include: ${OpenCASCADE_INCLUDE_DIR}")
-message(STATUS "OpenCASCADE library: ${OpenCASCADE_LIBRARY_DIR}")
+set(OCCT_INCLUDE_DIR "${OCCT_ROOT}/include/opencascade")
+set(OCCT_LIBRARY_DIR "${OCCT_ROOT}/lib")
+
+if(NOT EXISTS "${OCCT_INCLUDE_DIR}")
+  message(FATAL_ERROR "OCCT include directory not found: ${OCCT_INCLUDE_DIR}")
+endif()
+
+if(NOT EXISTS "${OCCT_LIBRARY_DIR}")
+  message(FATAL_ERROR "OCCT library directory not found: ${OCCT_LIBRARY_DIR}")
+endif()
+
+# Use Qt from the same conda environment as OCCT.
+list(PREPEND CMAKE_PREFIX_PATH "${OCCT_ROOT}")
+find_package(Qt6 CONFIG REQUIRED COMPONENTS Widgets)
+
+# Do not use OpenCASCADEConfig.cmake here.
+# The conda package exports TKIVtk, whose imported target references VTK targets
+# even though MyCAD does not use VTK. Link OCCT import libraries directly instead.
+file(GLOB OCCT_TOOLKIT_LIBS CONFIGURE_DEPENDS "${OCCT_LIBRARY_DIR}/TK*.lib")
+list(FILTER OCCT_TOOLKIT_LIBS EXCLUDE REGEX "TKIVtk.*\\.lib$")
+
+if(NOT OCCT_TOOLKIT_LIBS)
+  message(FATAL_ERROR "No OpenCASCADE toolkit libraries found in ${OCCT_LIBRARY_DIR}")
+endif()
+
+message(STATUS "OCCT root: ${OCCT_ROOT}")
+message(STATUS "OCCT include: ${OCCT_INCLUDE_DIR}")
+message(STATUS "OCCT library count: ${OCCT_TOOLKIT_LIBS}")
 
 add_executable(MyCAD WIN32
   src/main.cpp
 )
 
 target_include_directories(MyCAD PRIVATE
-  ${OpenCASCADE_INCLUDE_DIR}
-)
-
-target_link_directories(MyCAD PRIVATE
-  ${OpenCASCADE_LIBRARY_DIR}
+  "${OCCT_INCLUDE_DIR}"
 )
 
 target_link_libraries(MyCAD PRIVATE
   Qt6::Widgets
-  ${OpenCASCADE_LIBRARIES}
+  ${OCCT_TOOLKIT_LIBS}
 )
 
 target_compile_definitions(MyCAD PRIVATE
