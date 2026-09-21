@@ -151,13 +151,18 @@ protected:
 
     void mousePressEvent(QMouseEvent* event) override
     {
-        lastMousePos_ = event->position().toPoint();
+        lastMousePos_ = toOcctPoint(event->position());
 
-        if (event->button() == Qt::RightButton) {
+        if (event->button() == Qt::MiddleButton) {
+            if (event->modifiers().testFlag(Qt::ShiftModifier)) {
+                panning_ = true;
+            } else {
+                rotating_ = true;
+                view_->StartRotation(lastMousePos_.x(), lastMousePos_.y());
+            }
+        } else if (event->button() == Qt::RightButton) {
             rotating_ = true;
             view_->StartRotation(lastMousePos_.x(), lastMousePos_.y());
-        } else if (event->button() == Qt::MiddleButton) {
-            panning_ = true;
         } else if (event->button() == Qt::LeftButton) {
             context_->MoveTo(lastMousePos_.x(), lastMousePos_.y(), view_, true);
             context_->SelectDetected();
@@ -168,10 +173,9 @@ protected:
 
     void mouseReleaseEvent(QMouseEvent* event) override
     {
-        if (event->button() == Qt::RightButton) {
+        if (event->button() == Qt::MiddleButton ||
+            event->button() == Qt::RightButton) {
             rotating_ = false;
-        }
-        if (event->button() == Qt::MiddleButton) {
             panning_ = false;
         }
         event->accept();
@@ -179,7 +183,7 @@ protected:
 
     void mouseMoveEvent(QMouseEvent* event) override
     {
-        const QPoint current = event->position().toPoint();
+        const QPoint current = toOcctPoint(event->position());
 
         if (rotating_) {
             view_->Rotation(current.x(), current.y());
@@ -204,6 +208,14 @@ protected:
     }
 
 private:
+    QPoint toOcctPoint(const QPointF& position) const
+    {
+        const qreal scale = devicePixelRatioF();
+        return QPoint(
+            qRound(position.x() * scale),
+            qRound(position.y() * scale));
+    }
+
     void initializeViewer()
     {
         Handle(Aspect_DisplayConnection) displayConnection = new Aspect_DisplayConnection();
@@ -246,7 +258,7 @@ class MainWindow final : public QMainWindow
 public:
     MainWindow()
     {
-        setWindowTitle("MyCAD V0.1");
+        setWindowTitle("MyCAD V0.1.1");
         resize(1400, 900);
 
         view_ = new CadView(this);
@@ -260,7 +272,7 @@ public:
 
         buildMenus();
         statusBar()->showMessage(
-            QString::fromUtf8("MyCAD Standalone — Qt + Open CASCADE"));
+            QString::fromUtf8("中鍵拖曳：旋轉｜Shift+中鍵：平移｜滾輪：縮放｜右鍵拖曳：旋轉"));
 
         addBox(100.0, 60.0, 20.0);
     }
@@ -539,7 +551,7 @@ int main(int argc, char* argv[])
     QApplication app(argc, argv);
     app.setApplicationName("MyCAD");
     app.setOrganizationName("MyCAD Project");
-    app.setApplicationVersion("0.1.0");
+    app.setApplicationVersion("0.1.1");
 
     MainWindow window;
     window.show();
