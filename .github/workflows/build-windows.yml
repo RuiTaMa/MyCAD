@@ -68,11 +68,28 @@ jobs:
           Get-ChildItem $runtimeBin -File -Filter "*.dll" |
             Copy-Item -Destination dist -Force
 
-          # Qt searches for the Windows platform plugin at appdir/platforms.
-          # Copy plugin groups manually because conda's Qt package does not
-          # necessarily ship windeployqt.exe.
+          # Qt plugin locations differ between conda Qt builds.
+          # Find qwindows.dll dynamically instead of assuming a fixed path.
+          $qwindowsSource = Get-ChildItem $env:CONDA_PREFIX -Recurse -File -Filter "qwindows.dll" |
+            Select-Object -First 1
+
+          if (-not $qwindowsSource) {
+            Write-Host "Qt plugin candidates found under environment:"
+            Get-ChildItem $env:CONDA_PREFIX -Recurse -File -Filter "q*.dll" |
+              Where-Object { $_.FullName -match "plugin|platform" } |
+              Select-Object -First 100 |
+              ForEach-Object { Write-Host $_.FullName }
+            throw "qwindows.dll was not found anywhere under CONDA_PREFIX."
+          }
+
+          Write-Host "qwindows.dll found at: $($qwindowsSource.FullName)"
+          $platformDest = Join-Path $PWD "dist\platforms"
+          New-Item -ItemType Directory -Force $platformDest | Out-Null
+          Copy-Item $qwindowsSource.FullName (Join-Path $platformDest "qwindows.dll") -Force
+
+          # Copy companion plugin groups from the same Qt plugin root when present.
+          $pluginsRoot = Split-Path $qwindowsSource.Directory.FullName -Parent
           $pluginGroups = @(
-            "platforms",
             "styles",
             "imageformats",
             "iconengines",
@@ -82,10 +99,11 @@ jobs:
           )
 
           foreach ($group in $pluginGroups) {
-            $source = Join-Path $pluginRoot $group
+            $source = Join-Path $pluginsRoot $group
             if (Test-Path $source) {
               $destination = Join-Path $PWD "dist\$group"
-              Copy-Item $source $destination -Recurse -Force
+              New-Item -ItemType Directory -Force $destination | Out-Null
+              Copy-Item (Join-Path $source "*") $destination -Recurse -Force
             }
           }
 
