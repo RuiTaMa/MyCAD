@@ -66,43 +66,49 @@ jobs:
           & $windeploy --release --compiler-runtime --no-translations (Join-Path $PWD "dist\MyCAD.exe")
           if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
 
-          # Bundle the Microsoft VC++ runtime explicitly.
-          # Qt and OpenCASCADE are built with MSVC and require these DLLs on systems
-          # that do not already have the matching VC++ Redistributable installed.
-          $vsRoots = @(
-            "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC",
-            "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Redist\MSVC",
-            "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC",
-            "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC"
-          )
+          # Bundle Microsoft VC++ runtime explicitly.
+          # Locate Visual Studio dynamically instead of assuming a fixed runner path.
+          $vswhere = "$env:ProgramFiles(x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe was not found on the GitHub runner."
+          }
 
-          $crtDir = $null
-          foreach ($root in $vsRoots) {
-            if (Test-Path $root) {
-              $latest = Get-ChildItem $root -Directory |
-                Sort-Object Name -Descending |
-                Select-Object -First 1
-              if ($latest) {
-                $candidate = Join-Path $latest.FullName "x64\Microsoft.VC143.CRT"
-                if (Test-Path $candidate) {
-                  $crtDir = $candidate
-                  break
-                }
-              }
+          $vsPath = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          if (-not $vsPath) {
+            throw "Visual Studio C++ toolchain was not found."
+          }
+
+          Write-Host "Visual Studio: $vsPath"
+
+          $redistRoot = Join-Path $vsPath "VC\Redist\MSVC"
+          if (-not (Test-Path $redistRoot)) {
+            throw "VC Redist root not found: $redistRoot"
+          }
+
+          $crtDir = Get-ChildItem $redistRoot -Directory -Recurse |
+            Where-Object { $_.FullName -match "\\x64\\Microsoft\.VC14[0-9]\.CRT$" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $crtDir) {
+            # Fallback: locate vcruntime140.dll and use its containing directory.
+            $runtimeDll = Get-ChildItem $redistRoot -File -Recurse -Filter "vcruntime140.dll" |
+              Where-Object { $_.FullName -match "\\x64\\" } |
+              Select-Object -First 1
+            if ($runtimeDll) {
+              $crtDir = $runtimeDll.Directory.FullName
             }
           }
 
           if (-not $crtDir) {
-            throw "Microsoft VC143 x64 runtime directory not found on runner."
+            throw "Microsoft VC++ x64 CRT directory could not be located under $redistRoot"
           }
 
           Write-Host "Bundling VC++ runtime from: $crtDir"
-          Copy-Item (Join-Path $crtDir "*.dll") dist -Force
+          Get-ChildItem $crtDir -File -Filter "*.dll" | Copy-Item -Destination dist -Force
 
           $requiredRuntime = @(
             "msvcp140.dll",
-            "msvcp140_1.dll",
-            "msvcp140_2.dll",
             "vcruntime140.dll",
             "vcruntime140_1.dll"
           )
