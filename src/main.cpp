@@ -1,23 +1,33 @@
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
 #include <QDockWidget>
+#include <QDoubleSpinBox>
+#include <QFormLayout>
 #include <QFileDialog>
 #include <QHeaderView>
 #include <QInputDialog>
+#include <QKeyEvent>
+#include <QLabel>
 #include <QMainWindow>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPaintEngine>
+#include <QPushButton>
 #include <QResizeEvent>
+#include <QSignalBlocker>
 #include <QStatusBar>
+#include <QTabWidget>
 #include <QTableWidget>
 #include <QToolBar>
 #include <QTreeWidget>
+#include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QWidget>
 
 #include <AIS_InteractiveContext.hxx>
+#include <AIS_InteractiveObject.hxx>
 #include <AIS_Shape.hxx>
 #include <Aspect_DisplayConnection.hxx>
 #include <Bnd_Box.hxx>
@@ -76,6 +86,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <vector>
 
 enum class ObjectKind
@@ -83,6 +94,22 @@ enum class ObjectKind
     Solid,
     Sketch,
     Imported
+};
+
+enum class SketchTool
+{
+    None,
+    Line,
+    Rectangle,
+    Circle
+};
+
+enum class TaskKind
+{
+    None,
+    Sketch,
+    Pad,
+    Pocket
 };
 
 static QString kindName(ObjectKind kind)
@@ -144,6 +171,79 @@ public:
         }
         viewer_.Nullify();
         driver_.Nullify();
+    }
+
+    void setSelectionCallback(
+        std::function<void(const Handle(AIS_InteractiveObject)&)> callback)
+    {
+        selectionCallback_ = std::move(callback);
+    }
+
+    void setSketchCommittedCallback(
+        std::function<void(const TopoDS_Shape&, const QString&)> callback)
+    {
+        sketchCommittedCallback_ = std::move(callback);
+    }
+
+    void setCancelCallback(std::function<void()> callback)
+    {
+        cancelCallback_ = std::move(callback);
+    }
+
+    void beginSketchTool(SketchTool tool)
+    {
+        clearPreview();
+        sketchTool_ = tool;
+        hasFirstSketchPoint_ = false;
+        setSketchGridVisible(true);
+        viewTop();
+        setFocus(Qt::OtherFocusReason);
+    }
+
+    void cancelSketchInteraction()
+    {
+        clearPreview();
+        sketchTool_ = SketchTool::None;
+        hasFirstSketchPoint_ = false;
+        setSketchGridVisible(false);
+        update();
+    }
+
+    void showPreviewShape(const TopoDS_Shape& shape)
+    {
+        clearPreview();
+        if (shape.IsNull()) {
+            return;
+        }
+
+        previewPresentation_ = new AIS_Shape(shape);
+        previewPresentation_->SetColor(
+            Quantity_Color(0.15, 0.65, 1.0, Quantity_TOC_RGB));
+        previewPresentation_->SetTransparency(0.55f);
+        context_->Display(previewPresentation_, false);
+        context_->SetDisplayMode(previewPresentation_, AIS_Shaded, false);
+        context_->UpdateCurrentViewer();
+    }
+
+    void clearPreview()
+    {
+        if (!previewPresentation_.IsNull()) {
+            context_->Remove(previewPresentation_, false);
+            previewPresentation_.Nullify();
+            context_->UpdateCurrentViewer();
+        }
+    }
+
+    void selectPresentations(
+        const std::vector<Handle(AIS_Shape)>& presentations)
+    {
+        context_->ClearSelected(false);
+        for (const auto& presentation : presentations) {
+            if (!presentation.IsNull()) {
+                context_->AddOrRemoveSelected(presentation, false);
+            }
+        }
+        context_->UpdateCurrentViewer();
     }
 
     Handle(AIS_Shape) displayShape(
@@ -288,6 +388,16 @@ protected:
         setFocus(Qt::MouseFocusReason);
         lastMousePos_ = toOcctPoint(event->position());
 
+        if (event->button() == Qt::LeftButton &&
+            sketchTool_ != SketchTool::None) {
+            gp_Pnt point;
+            if (screenToSketchPlane(lastMousePos_, point)) {
+                handleSketchClick(point);
+            }
+            event->accept();
+            return;
+        }
+
         if (event->button() == Qt::MiddleButton) {
             if (event->modifiers().testFlag(Qt::ShiftModifier)) {
                 panning_ = true;
@@ -301,6 +411,15 @@ protected:
         } else if (event->button() == Qt::LeftButton) {
             context_->MoveTo(lastMousePos_.x(), lastMousePos_.y(), view_, true);
             context_->SelectDetected();
+
+            if (selectionCallback_) {
+                Handle(AIS_InteractiveObject) selected;
+                context_->InitSelected();
+                if (context_->MoreSelected()) {
+                    selected = context_->SelectedInteractive();
+                }
+                selectionCallback_(selected);
+            }
         }
 
         event->accept();
@@ -325,6 +444,12 @@ protected:
         } else if (panning_) {
             const QPoint delta = current - lastMousePos_;
             view_->Pan(delta.x(), -delta.y());
+        } else if (sketchTool_ != SketchTool::None &&
+                   hasFirstSketchPoint_) {
+            gp_Pnt point;
+            if (screenToSketchPlane(current, point)) {
+                updateSketchPreview(point);
+            }
         } else {
             context_->MoveTo(current.x(), current.y(), view_, false);
         }
@@ -332,6 +457,19 @@ protected:
         lastMousePos_ = current;
         update();
         event->accept();
+    }
+
+    void keyPressEvent(QKeyEvent* event) override
+    {
+        if (event->key() == Qt::Key_Escape) {
+            cancelSketchInteraction();
+            if (cancelCallback_) {
+                cancelCallback_();
+            }
+            event->accept();
+            return;
+        }
+        QWidget::keyPressEvent(event);
     }
 
     void wheelEvent(QWheelEvent* event) override
@@ -350,6 +488,162 @@ private:
         return QPoint(
             qRound(position.x() * scale),
             qRound(position.y() * scale));
+    }
+
+    bool screenToSketchPlane(const QPoint& pixel, gp_Pnt& point) const
+    {
+        Standard_Real x = 0.0;
+        Standard_Real y = 0.0;
+        Standard_Real z = 0.0;
+        Standard_Real vx = 0.0;
+        Standard_Real vy = 0.0;
+        Standard_Real vz = 0.0;
+
+        view_->ConvertWithProj(
+            pixel.x(), pixel.y(),
+            x, y, z,
+            vx, vy, vz);
+
+        if (std::abs(vz) < 1.0e-12) {
+            return false;
+        }
+
+        const Standard_Real t = -z / vz;
+        point = gp_Pnt(
+            x + t * vx,
+            y + t * vy,
+            0.0);
+        return true;
+    }
+
+    TopoDS_Shape makeSketchShape(
+        const gp_Pnt& first,
+        const gp_Pnt& second,
+        bool closedFace) const
+    {
+        if (sketchTool_ == SketchTool::Line) {
+            return BRepBuilderAPI_MakeEdge(first, second).Shape();
+        }
+
+        if (sketchTool_ == SketchTool::Rectangle) {
+            BRepBuilderAPI_MakePolygon polygon;
+            polygon.Add(gp_Pnt(first.X(), first.Y(), 0.0));
+            polygon.Add(gp_Pnt(second.X(), first.Y(), 0.0));
+            polygon.Add(gp_Pnt(second.X(), second.Y(), 0.0));
+            polygon.Add(gp_Pnt(first.X(), second.Y(), 0.0));
+            polygon.Close();
+
+            if (closedFace) {
+                return BRepBuilderAPI_MakeFace(polygon.Wire()).Shape();
+            }
+            return polygon.Wire();
+        }
+
+        if (sketchTool_ == SketchTool::Circle) {
+            const double dx = second.X() - first.X();
+            const double dy = second.Y() - first.Y();
+            const double radius = std::sqrt(dx * dx + dy * dy);
+            if (radius < 1.0e-6) {
+                return TopoDS_Shape();
+            }
+
+            gp_Circ circle(
+                gp_Ax2(first, gp_Dir(0.0, 0.0, 1.0)),
+                radius);
+            TopoDS_Edge edge = BRepBuilderAPI_MakeEdge(circle).Edge();
+            if (!closedFace) {
+                return edge;
+            }
+            TopoDS_Wire wire = BRepBuilderAPI_MakeWire(edge).Wire();
+            return BRepBuilderAPI_MakeFace(wire).Shape();
+        }
+
+        return TopoDS_Shape();
+    }
+
+    void handleSketchClick(const gp_Pnt& point)
+    {
+        if (!hasFirstSketchPoint_) {
+            firstSketchPoint_ = point;
+            hasFirstSketchPoint_ = true;
+            return;
+        }
+
+        TopoDS_Shape shape =
+            makeSketchShape(firstSketchPoint_, point, true);
+        if (!shape.IsNull() && sketchCommittedCallback_) {
+            QString baseName = "Sketch";
+            if (sketchTool_ == SketchTool::Line) baseName = "SketchLine";
+            if (sketchTool_ == SketchTool::Rectangle) baseName = "SketchRect";
+            if (sketchTool_ == SketchTool::Circle) baseName = "SketchCircle";
+            sketchCommittedCallback_(shape, baseName);
+        }
+
+        clearPreview();
+        hasFirstSketchPoint_ = false;
+    }
+
+    void updateSketchPreview(const gp_Pnt& point)
+    {
+        TopoDS_Shape preview =
+            makeSketchShape(firstSketchPoint_, point, false);
+
+        clearPreview();
+        if (preview.IsNull()) {
+            return;
+        }
+
+        previewPresentation_ = new AIS_Shape(preview);
+        previewPresentation_->SetColor(
+            Quantity_Color(0.20, 0.75, 1.0, Quantity_TOC_RGB));
+        context_->Display(previewPresentation_, false);
+        context_->SetDisplayMode(
+            previewPresentation_,
+            AIS_WireFrame,
+            false);
+        context_->UpdateCurrentViewer();
+    }
+
+    void setSketchGridVisible(bool visible)
+    {
+        if (gridPresentation_.IsNull()) {
+            BRep_Builder builder;
+            TopoDS_Compound compound;
+            builder.MakeCompound(compound);
+
+            constexpr double extent = 100.0;
+            constexpr double step = 10.0;
+
+            for (int i = -10; i <= 10; ++i) {
+                const double d = i * step;
+                builder.Add(
+                    compound,
+                    BRepBuilderAPI_MakeEdge(
+                        gp_Pnt(-extent, d, 0.0),
+                        gp_Pnt(extent, d, 0.0)).Shape());
+                builder.Add(
+                    compound,
+                    BRepBuilderAPI_MakeEdge(
+                        gp_Pnt(d, -extent, 0.0),
+                        gp_Pnt(d, extent, 0.0)).Shape());
+            }
+
+            gridPresentation_ = new AIS_Shape(compound);
+            gridPresentation_->SetColor(
+                Quantity_Color(0.68, 0.70, 0.72, Quantity_TOC_RGB));
+            context_->Display(gridPresentation_, false);
+            context_->SetDisplayMode(
+                gridPresentation_,
+                AIS_WireFrame,
+                false);
+        }
+
+        if (visible) {
+            context_->Display(gridPresentation_, false);
+        } else {
+            context_->Erase(gridPresentation_, false);
+        }
+        context_->UpdateCurrentViewer();
     }
 
     void initializeViewer()
@@ -385,6 +679,17 @@ private:
     Handle(V3d_View) view_;
     Handle(AIS_InteractiveContext) context_;
 
+    Handle(AIS_Shape) previewPresentation_;
+    Handle(AIS_Shape) gridPresentation_;
+
+    std::function<void(const Handle(AIS_InteractiveObject)&)> selectionCallback_;
+    std::function<void(const TopoDS_Shape&, const QString&)> sketchCommittedCallback_;
+    std::function<void()> cancelCallback_;
+
+    SketchTool sketchTool_ = SketchTool::None;
+    gp_Pnt firstSketchPoint_;
+    bool hasFirstSketchPoint_ = false;
+
     QPoint lastMousePos_;
     bool rotating_ = false;
     bool panning_ = false;
@@ -395,11 +700,31 @@ class MainWindow final : public QMainWindow
 public:
     MainWindow()
     {
-        setWindowTitle("MyCAD V0.2");
+        setWindowTitle("MyCAD V0.3 UX");
         resize(1500, 920);
 
         view_ = new CadView(this);
         setCentralWidget(view_);
+
+        view_->setSelectionCallback(
+            [this](const Handle(AIS_InteractiveObject)& selected) {
+                syncTreeFromViewport(selected);
+            });
+        view_->setSketchCommittedCallback(
+            [this](const TopoDS_Shape& shape, const QString& baseName) {
+                addShape(
+                    QString("%1_%2").arg(baseName).arg(++objectCounter_),
+                    ObjectKind::Sketch,
+                    shape,
+                    true);
+                taskHelpLabel_->setText(
+                    QString::fromUtf8(
+                        "已建立草圖幾何。可繼續繪製，按 Esc 或「完成」離開草圖模式。"));
+            });
+        view_->setCancelCallback(
+            [this]() {
+                cancelTask(false);
+            });
 
         buildModelDock();
         buildPropertyDock();
@@ -428,22 +753,105 @@ private:
             modelTree_,
             &QTreeWidget::itemSelectionChanged,
             this,
-            [this]() { updateProperties(); });
+            [this]() {
+                updateProperties();
+                syncViewportFromTree();
+            });
     }
 
     void buildPropertyDock()
     {
         propertyDock_ =
-            new QDockWidget(QString::fromUtf8("屬性 / 測量"), this);
-        propertyTable_ = new QTableWidget(propertyDock_);
+            new QDockWidget(QString::fromUtf8("工作 / 屬性"), this);
+
+        propertyTabs_ = new QTabWidget(propertyDock_);
+
+        taskPage_ = new QWidget(propertyTabs_);
+        auto* taskLayout = new QVBoxLayout(taskPage_);
+        taskTitleLabel_ = new QLabel(
+            QString::fromUtf8("沒有進行中的命令"),
+            taskPage_);
+        QFont titleFont = taskTitleLabel_->font();
+        titleFont.setBold(true);
+        titleFont.setPointSize(titleFont.pointSize() + 2);
+        taskTitleLabel_->setFont(titleFont);
+
+        taskHelpLabel_ = new QLabel(
+            QString::fromUtf8(
+                "從上方工具列選擇草圖或建模命令。"),
+            taskPage_);
+        taskHelpLabel_->setWordWrap(true);
+
+        taskValueLabel_ =
+            new QLabel(QString::fromUtf8("長度 (mm)"), taskPage_);
+        taskValueSpin_ = new QDoubleSpinBox(taskPage_);
+        taskValueSpin_->setDecimals(3);
+        taskValueSpin_->setRange(-1000000.0, 1000000.0);
+        taskValueSpin_->setValue(20.0);
+        taskValueSpin_->setSingleStep(1.0);
+
+        taskReverse_ =
+            new QCheckBox(QString::fromUtf8("反向"), taskPage_);
+
+        auto* form = new QFormLayout();
+        form->addRow(taskValueLabel_, taskValueSpin_);
+        form->addRow(QString(), taskReverse_);
+
+        taskApplyButton_ =
+            new QPushButton(QString::fromUtf8("套用"), taskPage_);
+        taskCancelButton_ =
+            new QPushButton(QString::fromUtf8("取消"), taskPage_);
+
+        auto* buttonRow = new QHBoxLayout();
+        buttonRow->addWidget(taskApplyButton_);
+        buttonRow->addWidget(taskCancelButton_);
+
+        taskLayout->addWidget(taskTitleLabel_);
+        taskLayout->addWidget(taskHelpLabel_);
+        taskLayout->addLayout(form);
+        taskLayout->addStretch();
+        taskLayout->addLayout(buttonRow);
+
+        connect(
+            taskValueSpin_,
+            qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this,
+            [this](double) { updateTaskPreview(); });
+        connect(
+            taskReverse_,
+            &QCheckBox::toggled,
+            this,
+            [this](bool) { updateTaskPreview(); });
+        connect(
+            taskApplyButton_,
+            &QPushButton::clicked,
+            this,
+            [this]() { applyTask(); });
+        connect(
+            taskCancelButton_,
+            &QPushButton::clicked,
+            this,
+            [this]() { cancelTask(); });
+
+        propertyTable_ = new QTableWidget(propertyTabs_);
         propertyTable_->setColumnCount(2);
         propertyTable_->setHorizontalHeaderLabels(
             {QString::fromUtf8("屬性"), QString::fromUtf8("值")});
         propertyTable_->horizontalHeader()->setStretchLastSection(true);
         propertyTable_->verticalHeader()->setVisible(false);
         propertyTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-        propertyDock_->setWidget(propertyTable_);
+
+        propertyTabs_->addTab(
+            taskPage_,
+            QString::fromUtf8("工作"));
+        propertyTabs_->addTab(
+            propertyTable_,
+            QString::fromUtf8("屬性"));
+
+        propertyDock_->setWidget(propertyTabs_);
         addDockWidget(Qt::RightDockWidgetArea, propertyDock_);
+
+        showTaskIdle();
     }
 
     void buildMenus()
@@ -463,6 +871,10 @@ private:
         QToolBar* sketchBar = addToolBar(QString::fromUtf8("草圖"));
         QToolBar* modelBar = addToolBar(QString::fromUtf8("建模"));
         QToolBar* viewBar = addToolBar(QString::fromUtf8("視圖"));
+
+        sketchBar->setMovable(false);
+        modelBar->setMovable(false);
+        viewBar->setMovable(false);
 
         QAction* newAct = new QAction(QString::fromUtf8("新建"), this);
         QAction* importStepAct =
@@ -513,9 +925,24 @@ private:
         QAction* sketchLineAct =
             new QAction(QString::fromUtf8("直線草圖"), this);
 
-        connect(sketchRectAct, &QAction::triggered, this, [this]() { createRectangleSketch(); });
-        connect(sketchCircleAct, &QAction::triggered, this, [this]() { createCircleSketch(); });
-        connect(sketchLineAct, &QAction::triggered, this, [this]() { createLineSketch(); });
+        connect(sketchRectAct, &QAction::triggered, this, [this]() {
+            startSketchTask(
+                SketchTool::Rectangle,
+                QString::fromUtf8("矩形草圖"),
+                QString::fromUtf8("在工作區點一下第一個角，再點一下對角。"));
+        });
+        connect(sketchCircleAct, &QAction::triggered, this, [this]() {
+            startSketchTask(
+                SketchTool::Circle,
+                QString::fromUtf8("圓形草圖"),
+                QString::fromUtf8("先點圓心，再點圓周決定半徑。"));
+        });
+        connect(sketchLineAct, &QAction::triggered, this, [this]() {
+            startSketchTask(
+                SketchTool::Line,
+                QString::fromUtf8("直線草圖"),
+                QString::fromUtf8("點兩個端點建立直線。"));
+        });
 
         sketchMenu->addActions({sketchRectAct, sketchCircleAct, sketchLineAct});
         sketchBar->addActions({sketchRectAct, sketchCircleAct});
@@ -525,8 +952,8 @@ private:
         QAction* revolveAct = new QAction(QString::fromUtf8("旋轉 Revolve"), this);
         QAction* holeAct = new QAction(QString::fromUtf8("孔 Hole"), this);
 
-        connect(padAct, &QAction::triggered, this, [this]() { padSketch(); });
-        connect(pocketAct, &QAction::triggered, this, [this]() { pocketSketch(); });
+        connect(padAct, &QAction::triggered, this, [this]() { startPadTask(); });
+        connect(pocketAct, &QAction::triggered, this, [this]() { startPocketTask(); });
         connect(revolveAct, &QAction::triggered, this, [this]() { revolveSketch(); });
         connect(holeAct, &QAction::triggered, this, [this]() { createHole(); });
 
@@ -545,6 +972,7 @@ private:
         QAction* chamferAct = new QAction(QString::fromUtf8("倒角 Chamfer"), this);
         QAction* patternAct = new QAction(QString::fromUtf8("線性陣列"), this);
         QAction* deleteAct = new QAction(QString::fromUtf8("刪除"), this);
+        deleteAct->setShortcut(QKeySequence::Delete);
 
         connect(boxAct, &QAction::triggered, this, [this]() { createBox(); });
         connect(cylinderAct, &QAction::triggered, this, [this]() { createCylinder(); });
@@ -595,6 +1023,7 @@ private:
         QAction* rightAct = new QAction(QString::fromUtf8("右視"), this);
         QAction* leftAct = new QAction(QString::fromUtf8("左視"), this);
         QAction* fitAct = new QAction("Fit All", this);
+        fitAct->setShortcut(QKeySequence("F"));
         QAction* wireAct = new QAction(QString::fromUtf8("線框"), this);
         QAction* shadedAct = new QAction(QString::fromUtf8("著色"), this);
         QAction* hideAct = new QAction(QString::fromUtf8("隱藏"), this);
@@ -621,6 +1050,325 @@ private:
         viewMenu->addSeparator();
         viewMenu->addActions({wireAct, shadedAct, hideAct, showAct});
         viewBar->addActions({axoAct, topAct, frontAct, rightAct, fitAct});
+    }
+
+    void showTaskIdle()
+    {
+        taskKind_ = TaskKind::None;
+        taskPrimaryIndex_ = -1;
+        taskSecondaryIndex_ = -1;
+
+        taskTitleLabel_->setText(
+            QString::fromUtf8("沒有進行中的命令"));
+        taskHelpLabel_->setText(
+            QString::fromUtf8(
+                "從工具列選擇草圖或建模命令。3D 視窗與模型樹的選取會同步。"));
+        taskValueLabel_->setVisible(false);
+        taskValueSpin_->setVisible(false);
+        taskReverse_->setVisible(false);
+        taskApplyButton_->setVisible(false);
+        taskCancelButton_->setVisible(false);
+        propertyTabs_->setCurrentWidget(propertyTable_);
+    }
+
+    void startSketchTask(
+        SketchTool tool,
+        const QString& title,
+        const QString& help)
+    {
+        cancelTask();
+        taskKind_ = TaskKind::Sketch;
+
+        taskTitleLabel_->setText(title);
+        taskHelpLabel_->setText(help);
+        taskValueLabel_->setVisible(false);
+        taskValueSpin_->setVisible(false);
+        taskReverse_->setVisible(false);
+        taskApplyButton_->setText(QString::fromUtf8("完成"));
+        taskApplyButton_->setVisible(true);
+        taskCancelButton_->setVisible(true);
+
+        propertyTabs_->setCurrentWidget(taskPage_);
+        view_->beginSketchTool(tool);
+        statusBar()->showMessage(
+            QString::fromUtf8(
+                "草圖模式：左鍵繪製｜中鍵旋轉｜Shift+中鍵平移｜Esc 離開"));
+    }
+
+    void startPadTask()
+    {
+        int index = -1;
+        if (!selectedSketchFace(index)) {
+            QMessageBox::information(
+                this,
+                "Pad",
+                QString::fromUtf8(
+                    "請先選取一個封閉的矩形或圓形草圖。"));
+            return;
+        }
+
+        cancelTask();
+        taskKind_ = TaskKind::Pad;
+        taskPrimaryIndex_ = index;
+
+        taskTitleLabel_->setText(
+            QString::fromUtf8("Pad 凸台"));
+        taskHelpLabel_->setText(
+            QString::fromUtf8(
+                "調整拉伸長度，3D 視窗會即時預覽。"));
+        taskValueLabel_->setText(
+            QString::fromUtf8("長度 (mm)"));
+        taskValueLabel_->setVisible(true);
+        taskValueSpin_->setVisible(true);
+        taskValueSpin_->setRange(0.001, 1000000.0);
+        taskValueSpin_->setValue(20.0);
+        taskReverse_->setChecked(false);
+        taskReverse_->setVisible(true);
+        taskApplyButton_->setText(QString::fromUtf8("套用"));
+        taskApplyButton_->setVisible(true);
+        taskCancelButton_->setVisible(true);
+
+        propertyTabs_->setCurrentWidget(taskPage_);
+        updateTaskPreview();
+    }
+
+    void startPocketTask()
+    {
+        const auto indices = selectedIndices();
+        if (indices.size() != 2) {
+            QMessageBox::information(
+                this,
+                "Pocket",
+                QString::fromUtf8(
+                    "請在模型樹同時選取一個實體與一個封閉草圖。"));
+            return;
+        }
+
+        int solidIndex = -1;
+        int sketchIndex = -1;
+        for (int index : indices) {
+            if (objects_[index].kind == ObjectKind::Sketch) {
+                sketchIndex = index;
+            } else {
+                solidIndex = index;
+            }
+        }
+
+        if (solidIndex < 0 || sketchIndex < 0 ||
+            !TopExp_Explorer(
+                objects_[sketchIndex].shape,
+                TopAbs_FACE).More()) {
+            QMessageBox::information(
+                this,
+                "Pocket",
+                QString::fromUtf8(
+                    "需要一個實體與一個封閉草圖。"));
+            return;
+        }
+
+        cancelTask();
+        taskKind_ = TaskKind::Pocket;
+        taskPrimaryIndex_ = solidIndex;
+        taskSecondaryIndex_ = sketchIndex;
+
+        taskTitleLabel_->setText(
+            QString::fromUtf8("Pocket 凹槽"));
+        taskHelpLabel_->setText(
+            QString::fromUtf8(
+                "調整切除深度，3D 視窗會即時預覽。"));
+        taskValueLabel_->setText(
+            QString::fromUtf8("深度 (mm)"));
+        taskValueLabel_->setVisible(true);
+        taskValueSpin_->setVisible(true);
+        taskValueSpin_->setRange(0.001, 1000000.0);
+        taskValueSpin_->setValue(20.0);
+        taskReverse_->setChecked(false);
+        taskReverse_->setVisible(true);
+        taskApplyButton_->setText(QString::fromUtf8("套用"));
+        taskApplyButton_->setVisible(true);
+        taskCancelButton_->setVisible(true);
+
+        propertyTabs_->setCurrentWidget(taskPage_);
+        updateTaskPreview();
+    }
+
+    TopoDS_Shape buildTaskResult() const
+    {
+        if (taskKind_ == TaskKind::Pad &&
+            taskPrimaryIndex_ >= 0 &&
+            taskPrimaryIndex_ < static_cast<int>(objects_.size())) {
+            double length = taskValueSpin_->value();
+            if (taskReverse_->isChecked()) {
+                length = -length;
+            }
+            return BRepPrimAPI_MakePrism(
+                objects_[taskPrimaryIndex_].shape,
+                gp_Vec(0.0, 0.0, length)).Shape();
+        }
+
+        if (taskKind_ == TaskKind::Pocket &&
+            taskPrimaryIndex_ >= 0 &&
+            taskSecondaryIndex_ >= 0 &&
+            taskPrimaryIndex_ < static_cast<int>(objects_.size()) &&
+            taskSecondaryIndex_ < static_cast<int>(objects_.size())) {
+            double depth = taskValueSpin_->value();
+            if (taskReverse_->isChecked()) {
+                depth = -depth;
+            }
+
+            TopoDS_Shape tool =
+                BRepPrimAPI_MakePrism(
+                    objects_[taskSecondaryIndex_].shape,
+                    gp_Vec(0.0, 0.0, depth)).Shape();
+
+            return BRepAlgoAPI_Cut(
+                objects_[taskPrimaryIndex_].shape,
+                tool).Shape();
+        }
+
+        return TopoDS_Shape();
+    }
+
+    void updateTaskPreview()
+    {
+        if (taskKind_ != TaskKind::Pad &&
+            taskKind_ != TaskKind::Pocket) {
+            return;
+        }
+
+        try {
+            TopoDS_Shape result = buildTaskResult();
+            if (!result.IsNull()) {
+                view_->showPreviewShape(result);
+            }
+        } catch (const Standard_Failure&) {
+            view_->clearPreview();
+        }
+    }
+
+    void applyTask()
+    {
+        if (taskKind_ == TaskKind::Sketch) {
+            cancelTask();
+            return;
+        }
+
+        if (taskKind_ != TaskKind::Pad &&
+            taskKind_ != TaskKind::Pocket) {
+            return;
+        }
+
+        try {
+            TopoDS_Shape result = buildTaskResult();
+            if (result.IsNull()) {
+                return;
+            }
+
+            const TaskKind completedKind = taskKind_;
+            const int primary = taskPrimaryIndex_;
+            const int secondary = taskSecondaryIndex_;
+
+            view_->clearPreview();
+            pushUndo();
+
+            if (completedKind == TaskKind::Pad) {
+                addShape(
+                    QString("Pad_%1").arg(++objectCounter_),
+                    ObjectKind::Solid,
+                    result,
+                    false);
+                if (primary >= 0 &&
+                    primary < static_cast<int>(objects_.size())) {
+                    objects_[primary].visible = false;
+                    view_->setVisible(
+                        objects_[primary].presentation,
+                        false);
+                }
+            } else {
+                addShape(
+                    QString("Pocket_%1").arg(++objectCounter_),
+                    ObjectKind::Solid,
+                    result,
+                    false);
+
+                if (primary >= 0 &&
+                    primary < static_cast<int>(objects_.size())) {
+                    objects_[primary].visible = false;
+                    view_->setVisible(
+                        objects_[primary].presentation,
+                        false);
+                }
+                if (secondary >= 0 &&
+                    secondary < static_cast<int>(objects_.size())) {
+                    objects_[secondary].visible = false;
+                    view_->setVisible(
+                        objects_[secondary].presentation,
+                        false);
+                }
+            }
+
+            rebuildTree();
+            cancelTask();
+        } catch (const Standard_Failure& e) {
+            showOcctError("MyCAD", e);
+        }
+    }
+
+    void cancelTask(bool notifyView = true)
+    {
+        view_->clearPreview();
+        if (notifyView) {
+            view_->cancelSketchInteraction();
+        }
+        showTaskIdle();
+        statusBar()->showMessage(
+            QString::fromUtf8(
+                "中鍵拖曳：旋轉｜Shift+中鍵：平移｜滾輪：縮放"));
+    }
+
+    void syncViewportFromTree()
+    {
+        std::vector<Handle(AIS_Shape)> presentations;
+        for (int index : selectedIndices()) {
+            presentations.push_back(objects_[index].presentation);
+        }
+        view_->selectPresentations(presentations);
+    }
+
+    void syncTreeFromViewport(
+        const Handle(AIS_InteractiveObject)& selected)
+    {
+        QSignalBlocker blocker(modelTree_);
+        modelTree_->clearSelection();
+
+        if (selected.IsNull()) {
+            updateProperties();
+            return;
+        }
+
+        Handle(AIS_Shape) selectedShape =
+            Handle(AIS_Shape)::DownCast(selected);
+
+        if (selectedShape.IsNull() ||
+            modelTree_->topLevelItemCount() == 0) {
+            updateProperties();
+            return;
+        }
+
+        QTreeWidgetItem* body =
+            modelTree_->topLevelItem(0);
+
+        for (int i = 0; i < static_cast<int>(objects_.size()); ++i) {
+            if (objects_[i].presentation == selectedShape &&
+                i < body->childCount()) {
+                QTreeWidgetItem* item = body->child(i);
+                item->setSelected(true);
+                modelTree_->setCurrentItem(item);
+                break;
+            }
+        }
+
+        updateProperties();
     }
 
     Snapshot captureSnapshot() const
@@ -687,12 +1435,13 @@ private:
 
     void newDocument()
     {
+        cancelTask();
         pushUndo();
         objects_.clear();
         modelTree_->clear();
         view_->clearScene();
         objectCounter_ = 0;
-        setWindowTitle("MyCAD V0.2");
+        setWindowTitle("MyCAD V0.3 UX");
         updateProperties();
     }
 
@@ -1495,16 +2244,30 @@ private:
 
         objects_.push_back(obj);
         rebuildTree();
-        view_->fitAll();
+
+        if (kind == ObjectKind::Sketch) {
+            view_->viewTop();
+        } else {
+            view_->fitAll();
+        }
+
         statusBar()->showMessage(name, 2500);
     }
 
     void rebuildTree()
     {
+        QSignalBlocker blocker(modelTree_);
         modelTree_->clear();
 
+        auto* body = new QTreeWidgetItem(modelTree_);
+        body->setText(0, "Body");
+        body->setData(0, Qt::UserRole, -1);
+        QFont bodyFont = body->font(0);
+        bodyFont.setBold(true);
+        body->setFont(0, bodyFont);
+
         for (int i = 0; i < static_cast<int>(objects_.size()); ++i) {
-            auto* item = new QTreeWidgetItem(modelTree_);
+            auto* item = new QTreeWidgetItem(body);
             item->setText(
                 0,
                 objects_[i].visible
@@ -1516,11 +2279,18 @@ private:
                 kindName(objects_[i].kind));
         }
 
-        if (modelTree_->topLevelItemCount() > 0) {
-            modelTree_->setCurrentItem(
-                modelTree_->topLevelItem(
-                    modelTree_->topLevelItemCount() - 1));
+        modelTree_->expandAll();
+
+        if (body->childCount() > 0) {
+            QTreeWidgetItem* last =
+                body->child(body->childCount() - 1);
+            last->setSelected(true);
+            modelTree_->setCurrentItem(last);
         }
+
+        blocker.unblock();
+        updateProperties();
+        syncViewportFromTree();
     }
 
     std::vector<int> selectedIndices() const
@@ -1910,7 +2680,20 @@ private:
     QDockWidget* modelDock_ = nullptr;
     QTreeWidget* modelTree_ = nullptr;
     QDockWidget* propertyDock_ = nullptr;
+    QTabWidget* propertyTabs_ = nullptr;
+    QWidget* taskPage_ = nullptr;
+    QLabel* taskTitleLabel_ = nullptr;
+    QLabel* taskHelpLabel_ = nullptr;
+    QLabel* taskValueLabel_ = nullptr;
+    QDoubleSpinBox* taskValueSpin_ = nullptr;
+    QCheckBox* taskReverse_ = nullptr;
+    QPushButton* taskApplyButton_ = nullptr;
+    QPushButton* taskCancelButton_ = nullptr;
     QTableWidget* propertyTable_ = nullptr;
+
+    TaskKind taskKind_ = TaskKind::None;
+    int taskPrimaryIndex_ = -1;
+    int taskSecondaryIndex_ = -1;
 
     std::vector<ModelObject> objects_;
     std::vector<Snapshot> undoStack_;
@@ -1923,7 +2706,7 @@ int main(int argc, char* argv[])
     QApplication app(argc, argv);
     app.setApplicationName("MyCAD");
     app.setOrganizationName("MyCAD Project");
-    app.setApplicationVersion("0.2.0");
+    app.setApplicationVersion("0.3.0");
 
     MainWindow window;
     window.show();
