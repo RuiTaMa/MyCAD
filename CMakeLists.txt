@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(MyCAD VERSION 0.1.2 LANGUAGES CXX)
+project(MyCAD VERSION 0.4.0 LANGUAGES CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "MyCAD currently targets Windows x64.")
@@ -45,6 +45,7 @@ message(STATUS "OCCT library count: ${OCCT_TOOLKIT_LIBS}")
 
 add_executable(MyCAD WIN32
   src/main.cpp
+  src/document/ModelTypes.h
 )
 
 target_include_directories(MyCAD PRIVATE

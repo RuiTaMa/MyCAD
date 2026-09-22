@@ -1,6 +1,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
@@ -22,6 +23,7 @@
 #include <QTableWidget>
 #include <QToolBar>
 #include <QTreeWidget>
+#include <QTreeWidgetItemIterator>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QWidget>
@@ -89,28 +91,7 @@
 #include <functional>
 #include <vector>
 
-enum class ObjectKind
-{
-    Solid,
-    Sketch,
-    Imported
-};
-
-enum class SketchTool
-{
-    None,
-    Line,
-    Rectangle,
-    Circle
-};
-
-enum class TaskKind
-{
-    None,
-    Sketch,
-    Pad,
-    Pocket
-};
+#include "document/ModelTypes.h"
 
 static QString kindName(ObjectKind kind)
 {
@@ -125,24 +106,20 @@ static QString kindName(ObjectKind kind)
     return QString();
 }
 
-struct ModelObject
+static QString datumPlaneName(DatumPlane plane)
 {
-    QString name;
-    ObjectKind kind = ObjectKind::Solid;
-    TopoDS_Shape shape;
-    Handle(AIS_Shape) presentation;
-    bool visible = true;
-};
-
-struct SnapshotObject
-{
-    QString name;
-    ObjectKind kind = ObjectKind::Solid;
-    TopoDS_Shape shape;
-    bool visible = true;
-};
-
-using Snapshot = std::vector<SnapshotObject>;
+    switch (plane) {
+    case DatumPlane::XY:
+        return "XY Plane";
+    case DatumPlane::YZ:
+        return "YZ Plane";
+    case DatumPlane::ZX:
+        return "ZX Plane";
+    case DatumPlane::None:
+        break;
+    }
+    return QString();
+}
 
 class CadView final : public QWidget
 {
@@ -190,13 +167,28 @@ public:
         cancelCallback_ = std::move(callback);
     }
 
-    void beginSketchTool(SketchTool tool)
+    void beginSketchTool(SketchTool tool, DatumPlane plane)
     {
         clearPreview();
+
+        if (!gridPresentation_.IsNull()) {
+            context_->Remove(gridPresentation_, false);
+            gridPresentation_.Nullify();
+        }
+
+        currentSketchPlane_ = plane;
         sketchTool_ = tool;
         hasFirstSketchPoint_ = false;
         setSketchGridVisible(true);
-        viewTop();
+
+        if (plane == DatumPlane::YZ) {
+            viewRight();
+        } else if (plane == DatumPlane::ZX) {
+            viewFront();
+        } else {
+            viewTop();
+        }
+
         setFocus(Qt::OtherFocusReason);
     }
 
@@ -504,16 +496,60 @@ private:
             x, y, z,
             vx, vy, vz);
 
-        if (std::abs(vz) < 1.0e-12) {
+        Standard_Real originCoord = z;
+        Standard_Real directionCoord = vz;
+
+        if (currentSketchPlane_ == DatumPlane::YZ) {
+            originCoord = x;
+            directionCoord = vx;
+        } else if (currentSketchPlane_ == DatumPlane::ZX) {
+            originCoord = y;
+            directionCoord = vy;
+        }
+
+        if (std::abs(directionCoord) < 1.0e-12) {
             return false;
         }
 
-        const Standard_Real t = -z / vz;
+        const Standard_Real t = -originCoord / directionCoord;
         point = gp_Pnt(
             x + t * vx,
             y + t * vy,
-            0.0);
+            z + t * vz);
         return true;
+    }
+
+    QPointF toSketchUV(const gp_Pnt& point) const
+    {
+        if (currentSketchPlane_ == DatumPlane::YZ) {
+            return QPointF(point.Y(), point.Z());
+        }
+        if (currentSketchPlane_ == DatumPlane::ZX) {
+            return QPointF(point.X(), point.Z());
+        }
+        return QPointF(point.X(), point.Y());
+    }
+
+    gp_Pnt fromSketchUV(double u, double v) const
+    {
+        if (currentSketchPlane_ == DatumPlane::YZ) {
+            return gp_Pnt(0.0, u, v);
+        }
+        if (currentSketchPlane_ == DatumPlane::ZX) {
+            return gp_Pnt(u, 0.0, v);
+        }
+        return gp_Pnt(u, v, 0.0);
+    }
+
+    gp_Dir sketchNormal() const
+    {
+        if (currentSketchPlane_ == DatumPlane::YZ) {
+            return gp_Dir(1.0, 0.0, 0.0);
+        }
+        if (currentSketchPlane_ == DatumPlane::ZX) {
+            return gp_Dir(0.0, 1.0, 0.0);
+        }
+        return gp_Dir(0.0, 0.0, 1.0);
     }
 
     TopoDS_Shape makeSketchShape(
@@ -525,12 +561,15 @@ private:
             return BRepBuilderAPI_MakeEdge(first, second).Shape();
         }
 
+        const QPointF firstUV = toSketchUV(first);
+        const QPointF secondUV = toSketchUV(second);
+
         if (sketchTool_ == SketchTool::Rectangle) {
             BRepBuilderAPI_MakePolygon polygon;
-            polygon.Add(gp_Pnt(first.X(), first.Y(), 0.0));
-            polygon.Add(gp_Pnt(second.X(), first.Y(), 0.0));
-            polygon.Add(gp_Pnt(second.X(), second.Y(), 0.0));
-            polygon.Add(gp_Pnt(first.X(), second.Y(), 0.0));
+            polygon.Add(fromSketchUV(firstUV.x(), firstUV.y()));
+            polygon.Add(fromSketchUV(secondUV.x(), firstUV.y()));
+            polygon.Add(fromSketchUV(secondUV.x(), secondUV.y()));
+            polygon.Add(fromSketchUV(firstUV.x(), secondUV.y()));
             polygon.Close();
 
             if (closedFace) {
@@ -540,15 +579,15 @@ private:
         }
 
         if (sketchTool_ == SketchTool::Circle) {
-            const double dx = second.X() - first.X();
-            const double dy = second.Y() - first.Y();
-            const double radius = std::sqrt(dx * dx + dy * dy);
+            const double du = secondUV.x() - firstUV.x();
+            const double dv = secondUV.y() - firstUV.y();
+            const double radius = std::sqrt(du * du + dv * dv);
             if (radius < 1.0e-6) {
                 return TopoDS_Shape();
             }
 
             gp_Circ circle(
-                gp_Ax2(first, gp_Dir(0.0, 0.0, 1.0)),
+                gp_Ax2(first, sketchNormal()),
                 radius);
             TopoDS_Edge edge = BRepBuilderAPI_MakeEdge(circle).Edge();
             if (!closedFace) {
@@ -619,13 +658,13 @@ private:
                 builder.Add(
                     compound,
                     BRepBuilderAPI_MakeEdge(
-                        gp_Pnt(-extent, d, 0.0),
-                        gp_Pnt(extent, d, 0.0)).Shape());
+                        fromSketchUV(-extent, d),
+                        fromSketchUV(extent, d)).Shape());
                 builder.Add(
                     compound,
                     BRepBuilderAPI_MakeEdge(
-                        gp_Pnt(d, -extent, 0.0),
-                        gp_Pnt(d, extent, 0.0)).Shape());
+                        fromSketchUV(d, -extent),
+                        fromSketchUV(d, extent)).Shape());
             }
 
             gridPresentation_ = new AIS_Shape(compound);
@@ -687,6 +726,7 @@ private:
     std::function<void()> cancelCallback_;
 
     SketchTool sketchTool_ = SketchTool::None;
+    DatumPlane currentSketchPlane_ = DatumPlane::XY;
     gp_Pnt firstSketchPoint_;
     bool hasFirstSketchPoint_ = false;
 
@@ -700,7 +740,7 @@ class MainWindow final : public QMainWindow
 public:
     MainWindow()
     {
-        setWindowTitle("MyCAD V0.3 UX");
+        setWindowTitle("MyCAD V0.4 CATIA Foundation");
         resize(1500, 920);
 
         view_ = new CadView(this);
@@ -868,13 +908,28 @@ private:
             menuBar()->addMenu(QString::fromUtf8("測量"));
         QMenu* viewMenu = menuBar()->addMenu(QString::fromUtf8("視圖"));
 
-        QToolBar* sketchBar = addToolBar(QString::fromUtf8("草圖"));
-        QToolBar* modelBar = addToolBar(QString::fromUtf8("建模"));
-        QToolBar* viewBar = addToolBar(QString::fromUtf8("視圖"));
+        QToolBar* workbenchBar =
+            addToolBar(QString::fromUtf8("工作台"));
+        workbenchBar->setMovable(false);
 
-        sketchBar->setMovable(false);
-        modelBar->setMovable(false);
-        viewBar->setMovable(false);
+        workbenchCombo_ = new QComboBox(workbenchBar);
+        workbenchCombo_->addItems({
+            "Part Design",
+            "Sketcher",
+            "Assembly Design",
+            "Drafting",
+            "Generative Shape Design"
+        });
+        workbenchCombo_->setMinimumWidth(190);
+        workbenchBar->addWidget(workbenchCombo_);
+
+        sketchBar_ = addToolBar(QString::fromUtf8("草圖"));
+        modelBar_ = addToolBar(QString::fromUtf8("建模"));
+        viewBar_ = addToolBar(QString::fromUtf8("視圖"));
+
+        sketchBar_->setMovable(false);
+        modelBar_->setMovable(false);
+        viewBar_->setMovable(false);
 
         QAction* newAct = new QAction(QString::fromUtf8("新建"), this);
         QAction* importStepAct =
@@ -945,7 +1000,7 @@ private:
         });
 
         sketchMenu->addActions({sketchRectAct, sketchCircleAct, sketchLineAct});
-        sketchBar->addActions({sketchRectAct, sketchCircleAct});
+        sketchBar_->addActions({sketchRectAct, sketchCircleAct});
 
         QAction* padAct = new QAction(QString::fromUtf8("凸台 Pad"), this);
         QAction* pocketAct = new QAction(QString::fromUtf8("凹槽 Pocket"), this);
@@ -958,7 +1013,7 @@ private:
         connect(holeAct, &QAction::triggered, this, [this]() { createHole(); });
 
         partDesignMenu->addActions({padAct, pocketAct, revolveAct, holeAct});
-        modelBar->addActions({padAct, pocketAct});
+        modelBar_->addActions({padAct, pocketAct});
 
         QAction* boxAct = new QAction(QString::fromUtf8("方塊"), this);
         QAction* cylinderAct = new QAction(QString::fromUtf8("圓柱"), this);
@@ -992,7 +1047,7 @@ private:
         partMenu->addActions({fuseAct, cutAct, commonAct});
         partMenu->addSeparator();
         partMenu->addActions({filletAct, chamferAct, patternAct, deleteAct});
-        modelBar->addActions({boxAct, cylinderAct, filletAct, chamferAct});
+        modelBar_->addActions({boxAct, cylinderAct, filletAct, chamferAct});
 
         QAction* moveAct = new QAction(QString::fromUtf8("移動"), this);
         QAction* rotateAct = new QAction(QString::fromUtf8("旋轉物件"), this);
@@ -1049,7 +1104,57 @@ private:
         viewMenu->addActions({axoAct, topAct, bottomAct, frontAct, backAct, rightAct, leftAct, fitAct});
         viewMenu->addSeparator();
         viewMenu->addActions({wireAct, shadedAct, hideAct, showAct});
-        viewBar->addActions({axoAct, topAct, frontAct, rightAct, fitAct});
+        viewBar_->addActions({axoAct, topAct, frontAct, rightAct, fitAct});
+
+        connect(
+            workbenchCombo_,
+            &QComboBox::currentTextChanged,
+            this,
+            [this](const QString& name) {
+                updateWorkbench(name);
+            });
+
+        updateWorkbench("Part Design");
+    }
+
+    void updateWorkbench(const QString& name)
+    {
+        const bool partDesign = name == "Part Design";
+        const bool sketcher = name == "Sketcher";
+
+        sketchBar_->setVisible(partDesign || sketcher);
+        modelBar_->setVisible(partDesign);
+        viewBar_->setVisible(true);
+
+        if (partDesign) {
+            statusBar()->showMessage(
+                QString::fromUtf8(
+                    "Part Design：請在 Origin 選擇基準面，再建立 Sketch。"));
+        } else if (sketcher) {
+            statusBar()->showMessage(
+                QString::fromUtf8(
+                    "Sketcher：選取 XY / YZ / ZX Plane 後使用草圖工具。"));
+        } else {
+            statusBar()->showMessage(
+                name + QString::fromUtf8(
+                    " 工作台已建立入口，功能將在後續版本逐步加入。"));
+        }
+    }
+
+    DatumPlane selectedDatumPlane() const
+    {
+        const auto items = modelTree_->selectedItems();
+        if (items.size() != 1) {
+            return DatumPlane::None;
+        }
+
+        const int code =
+            items.front()->data(0, Qt::UserRole).toInt();
+
+        if (code == -101) return DatumPlane::XY;
+        if (code == -102) return DatumPlane::YZ;
+        if (code == -103) return DatumPlane::ZX;
+        return DatumPlane::None;
     }
 
     void showTaskIdle()
@@ -1076,11 +1181,25 @@ private:
         const QString& title,
         const QString& help)
     {
+        const DatumPlane plane = selectedDatumPlane();
+        if (plane == DatumPlane::None) {
+            QMessageBox::information(
+                this,
+                QString::fromUtf8("建立草圖"),
+                QString::fromUtf8(
+                    "請先在 Part1 → Body → Origin 選取 XY Plane、YZ Plane 或 ZX Plane。"));
+            return;
+        }
+
         cancelTask();
         taskKind_ = TaskKind::Sketch;
 
-        taskTitleLabel_->setText(title);
-        taskHelpLabel_->setText(help);
+        taskTitleLabel_->setText(
+            title + " — " + datumPlaneName(plane));
+        taskHelpLabel_->setText(
+            help + "\n" +
+            QString::fromUtf8("支援平面：") +
+            datumPlaneName(plane));
         taskValueLabel_->setVisible(false);
         taskValueSpin_->setVisible(false);
         taskReverse_->setVisible(false);
@@ -1089,7 +1208,7 @@ private:
         taskCancelButton_->setVisible(true);
 
         propertyTabs_->setCurrentWidget(taskPage_);
-        view_->beginSketchTool(tool);
+        view_->beginSketchTool(tool, plane);
         statusBar()->showMessage(
             QString::fromUtf8(
                 "草圖模式：左鍵繪製｜中鍵旋轉｜Shift+中鍵平移｜Esc 離開"));
@@ -1355,13 +1474,22 @@ private:
             return;
         }
 
-        QTreeWidgetItem* body =
+        QTreeWidgetItem* part =
             modelTree_->topLevelItem(0);
+        if (part == nullptr || part->childCount() == 0) {
+            updateProperties();
+            return;
+        }
+
+        QTreeWidgetItem* body = part->child(0);
+        constexpr int featureOffset = 1; // Origin is child 0.
 
         for (int i = 0; i < static_cast<int>(objects_.size()); ++i) {
+            const int childIndex = i + featureOffset;
             if (objects_[i].presentation == selectedShape &&
-                i < body->childCount()) {
-                QTreeWidgetItem* item = body->child(i);
+                childIndex < body->childCount()) {
+                QTreeWidgetItem* item =
+                    body->child(childIndex);
                 item->setSelected(true);
                 modelTree_->setCurrentItem(item);
                 break;
@@ -1438,10 +1566,10 @@ private:
         cancelTask();
         pushUndo();
         objects_.clear();
-        modelTree_->clear();
         view_->clearScene();
         objectCounter_ = 0;
-        setWindowTitle("MyCAD V0.3 UX");
+        setWindowTitle("MyCAD V0.4 CATIA Foundation");
+        rebuildTree();
         updateProperties();
     }
 
@@ -2259,9 +2387,37 @@ private:
         QSignalBlocker blocker(modelTree_);
         modelTree_->clear();
 
-        auto* body = new QTreeWidgetItem(modelTree_);
+        auto* part = new QTreeWidgetItem(modelTree_);
+        part->setText(0, "Part1");
+        part->setData(0, Qt::UserRole, -100);
+
+        auto* body = new QTreeWidgetItem(part);
         body->setText(0, "Body");
-        body->setData(0, Qt::UserRole, -1);
+        body->setData(0, Qt::UserRole, -200);
+
+        auto* origin = new QTreeWidgetItem(body);
+        origin->setText(0, "Origin");
+        origin->setData(0, Qt::UserRole, -300);
+
+        auto addPlane = [origin](
+                            const QString& name,
+                            int code) {
+            auto* plane = new QTreeWidgetItem(origin);
+            plane->setText(0, name);
+            plane->setData(0, Qt::UserRole, code);
+            plane->setToolTip(
+                0,
+                QString::fromUtf8("基準面 — 選取後可建立 Sketch"));
+        };
+
+        addPlane("XY Plane", -101);
+        addPlane("YZ Plane", -102);
+        addPlane("ZX Plane", -103);
+
+        QFont partFont = part->font(0);
+        partFont.setBold(true);
+        part->setFont(0, partFont);
+
         QFont bodyFont = body->font(0);
         bodyFont.setBold(true);
         body->setFont(0, bodyFont);
@@ -2281,11 +2437,15 @@ private:
 
         modelTree_->expandAll();
 
-        if (body->childCount() > 0) {
+        if (!objects_.empty()) {
             QTreeWidgetItem* last =
                 body->child(body->childCount() - 1);
             last->setSelected(true);
             modelTree_->setCurrentItem(last);
+        } else {
+            QTreeWidgetItem* xyPlane = origin->child(0);
+            xyPlane->setSelected(true);
+            modelTree_->setCurrentItem(xyPlane);
         }
 
         blocker.unblock();
@@ -2328,6 +2488,21 @@ private:
     void updateProperties()
     {
         propertyTable_->setRowCount(0);
+
+        const DatumPlane datumPlane = selectedDatumPlane();
+        if (datumPlane != DatumPlane::None) {
+            addProperty(
+                QString::fromUtf8("類型"),
+                QString::fromUtf8("基準面"));
+            addProperty(
+                QString::fromUtf8("名稱"),
+                datumPlaneName(datumPlane));
+            addProperty(
+                QString::fromUtf8("用途"),
+                QString::fromUtf8("選取後可建立 Sketch"));
+            return;
+        }
+
         const auto indices = selectedIndices();
 
         if (indices.size() != 1) {
@@ -2679,6 +2854,11 @@ private:
     CadView* view_ = nullptr;
     QDockWidget* modelDock_ = nullptr;
     QTreeWidget* modelTree_ = nullptr;
+    QComboBox* workbenchCombo_ = nullptr;
+    QToolBar* sketchBar_ = nullptr;
+    QToolBar* modelBar_ = nullptr;
+    QToolBar* viewBar_ = nullptr;
+
     QDockWidget* propertyDock_ = nullptr;
     QTabWidget* propertyTabs_ = nullptr;
     QWidget* taskPage_ = nullptr;
@@ -2706,7 +2886,7 @@ int main(int argc, char* argv[])
     QApplication app(argc, argv);
     app.setApplicationName("MyCAD");
     app.setOrganizationName("MyCAD Project");
-    app.setApplicationVersion("0.3.0");
+    app.setApplicationVersion("0.4.0");
 
     MainWindow window;
     window.show();
