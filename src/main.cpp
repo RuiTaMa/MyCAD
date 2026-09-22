@@ -202,6 +202,12 @@ public:
         sketchPositionCallback_ = std::move(callback);
     }
 
+    void setSketchErrorCallback(
+        std::function<void(const QString&)> callback)
+    {
+        sketchErrorCallback_ = std::move(callback);
+    }
+
     void setSketchTool(SketchTool tool)
     {
         clearPreview();
@@ -563,12 +569,45 @@ protected:
 
         if (event->button() == Qt::LeftButton &&
             sketchTool_ != SketchTool::None) {
-            gp_Pnt point;
-            if (screenToSketchPlane(lastMousePos_, point)) {
-                point = snappedSketchPoint(point);
-                reportSketchPosition(point);
-                handleSketchClick(point);
+            try {
+                gp_Pnt point;
+
+                if (screenToSketchPlane(
+                        lastMousePos_,
+                        point)) {
+                    point =
+                        snappedSketchPoint(point);
+                    reportSketchPosition(point);
+                    handleSketchClick(point);
+                }
+            } catch (const Standard_Failure& error) {
+                clearPreview();
+                hasFirstSketchPoint_ = false;
+
+                if (sketchErrorCallback_) {
+                    QString message =
+                        QString::fromUtf8(
+                            "草圖幾何建立失敗，已取消目前圖元。");
+
+                    if (error.GetMessageString() != nullptr) {
+                        message += " ";
+                        message += QString::fromUtf8(
+                            error.GetMessageString());
+                    }
+
+                    sketchErrorCallback_(message);
+                }
+            } catch (...) {
+                clearPreview();
+                hasFirstSketchPoint_ = false;
+
+                if (sketchErrorCallback_) {
+                    sketchErrorCallback_(
+                        QString::fromUtf8(
+                            "草圖操作發生錯誤，已取消目前圖元。"));
+                }
             }
+
             event->accept();
             return;
         }
@@ -636,18 +675,33 @@ protected:
             const QPoint delta = current - lastMousePos_;
             view_->Pan(delta.x(), -delta.y());
         } else if (sketchSessionActive_) {
-            gp_Pnt point;
-            if (screenToSketchPlane(current, point)) {
-                point = snappedSketchPoint(point);
-                reportSketchPosition(point);
+            try {
+                gp_Pnt point;
 
-                if (sketchTool_ != SketchTool::None &&
-                    hasFirstSketchPoint_) {
-                    updateSketchPreview(point);
-                } else if (sketchTool_ == SketchTool::None) {
-                    context_->MoveTo(
-                        current.x(), current.y(), view_, false);
+                if (screenToSketchPlane(
+                        current,
+                        point)) {
+                    point =
+                        snappedSketchPoint(point);
+                    reportSketchPosition(point);
+
+                    if (sketchTool_ != SketchTool::None &&
+                        hasFirstSketchPoint_) {
+                        updateSketchPreview(point);
+                    } else if (
+                        sketchTool_ ==
+                        SketchTool::None) {
+                        context_->MoveTo(
+                            current.x(),
+                            current.y(),
+                            view_,
+                            false);
+                    }
                 }
+            } catch (const Standard_Failure&) {
+                clearPreview();
+            } catch (...) {
+                clearPreview();
             }
         } else {
             context_->MoveTo(current.x(), current.y(), view_, false);
@@ -799,44 +853,113 @@ private:
         const gp_Pnt& second,
         bool closedFace) const
     {
-        if (sketchTool_ == SketchTool::Line) {
-            return BRepBuilderAPI_MakeEdge(first, second).Shape();
-        }
+        constexpr double tolerance = 1.0e-6;
 
-        const QPointF firstUV = toSketchUV(first);
-        const QPointF secondUV = toSketchUV(second);
+        try {
+            if (sketchTool_ == SketchTool::Line) {
+                if (first.Distance(second) <= tolerance) {
+                    return TopoDS_Shape();
+                }
 
-        if (sketchTool_ == SketchTool::Rectangle) {
-            BRepBuilderAPI_MakePolygon polygon;
-            polygon.Add(fromSketchUV(firstUV.x(), firstUV.y()));
-            polygon.Add(fromSketchUV(secondUV.x(), firstUV.y()));
-            polygon.Add(fromSketchUV(secondUV.x(), secondUV.y()));
-            polygon.Add(fromSketchUV(firstUV.x(), secondUV.y()));
-            polygon.Close();
-
-            if (closedFace) {
-                return BRepBuilderAPI_MakeFace(polygon.Wire()).Shape();
-            }
-            return polygon.Wire();
-        }
-
-        if (sketchTool_ == SketchTool::Circle) {
-            const double du = secondUV.x() - firstUV.x();
-            const double dv = secondUV.y() - firstUV.y();
-            const double radius = std::sqrt(du * du + dv * dv);
-            if (radius < 1.0e-6) {
-                return TopoDS_Shape();
+                return BRepBuilderAPI_MakeEdge(
+                    first,
+                    second).Shape();
             }
 
-            gp_Circ circle(
-                gp_Ax2(first, sketchNormal()),
-                radius);
-            TopoDS_Edge edge = BRepBuilderAPI_MakeEdge(circle).Edge();
-            if (!closedFace) {
-                return edge;
+            const QPointF firstUV = toSketchUV(first);
+            const QPointF secondUV = toSketchUV(second);
+
+            if (sketchTool_ == SketchTool::Rectangle) {
+                const double width =
+                    std::abs(secondUV.x() - firstUV.x());
+                const double height =
+                    std::abs(secondUV.y() - firstUV.y());
+
+                if (width <= tolerance ||
+                    height <= tolerance) {
+                    return TopoDS_Shape();
+                }
+
+                BRepBuilderAPI_MakePolygon polygon;
+                polygon.Add(
+                    fromSketchUV(
+                        firstUV.x(),
+                        firstUV.y()));
+                polygon.Add(
+                    fromSketchUV(
+                        secondUV.x(),
+                        firstUV.y()));
+                polygon.Add(
+                    fromSketchUV(
+                        secondUV.x(),
+                        secondUV.y()));
+                polygon.Add(
+                    fromSketchUV(
+                        firstUV.x(),
+                        secondUV.y()));
+                polygon.Close();
+
+                if (!polygon.IsDone()) {
+                    return TopoDS_Shape();
+                }
+
+                if (closedFace) {
+                    BRepBuilderAPI_MakeFace faceMaker(
+                        polygon.Wire());
+
+                    if (!faceMaker.IsDone()) {
+                        return TopoDS_Shape();
+                    }
+
+                    return faceMaker.Shape();
+                }
+
+                return polygon.Wire();
             }
-            TopoDS_Wire wire = BRepBuilderAPI_MakeWire(edge).Wire();
-            return BRepBuilderAPI_MakeFace(wire).Shape();
+
+            if (sketchTool_ == SketchTool::Circle) {
+                const double du =
+                    secondUV.x() - firstUV.x();
+                const double dv =
+                    secondUV.y() - firstUV.y();
+                const double radius =
+                    std::sqrt(du * du + dv * dv);
+
+                if (radius <= tolerance) {
+                    return TopoDS_Shape();
+                }
+
+                gp_Circ circle(
+                    gp_Ax2(first, sketchNormal()),
+                    radius);
+
+                BRepBuilderAPI_MakeEdge edgeMaker(circle);
+                if (!edgeMaker.IsDone()) {
+                    return TopoDS_Shape();
+                }
+
+                TopoDS_Edge edge = edgeMaker.Edge();
+
+                if (!closedFace) {
+                    return edge;
+                }
+
+                BRepBuilderAPI_MakeWire wireMaker(edge);
+                if (!wireMaker.IsDone()) {
+                    return TopoDS_Shape();
+                }
+
+                BRepBuilderAPI_MakeFace faceMaker(
+                    wireMaker.Wire());
+
+                if (!faceMaker.IsDone()) {
+                    return TopoDS_Shape();
+                }
+
+                return faceMaker.Shape();
+            }
+        } catch (const Standard_Failure&) {
+            return TopoDS_Shape();
         }
 
         return TopoDS_Shape();
@@ -851,13 +974,39 @@ private:
         }
 
         TopoDS_Shape shape =
-            makeSketchShape(firstSketchPoint_, point, true);
-        if (!shape.IsNull() && sketchCommittedCallback_) {
+            makeSketchShape(
+                firstSketchPoint_,
+                point,
+                true);
+
+        if (shape.IsNull()) {
+            clearPreview();
+
+            if (sketchErrorCallback_) {
+                sketchErrorCallback_(
+                    QString::fromUtf8(
+                        "兩個點太接近或幾何尺寸為 0，請重新指定。"));
+            }
+
+            return;
+        }
+
+        if (sketchCommittedCallback_) {
             QString baseName = "Sketch";
-            if (sketchTool_ == SketchTool::Line) baseName = "SketchLine";
-            if (sketchTool_ == SketchTool::Rectangle) baseName = "SketchRect";
-            if (sketchTool_ == SketchTool::Circle) baseName = "SketchCircle";
-            sketchCommittedCallback_(shape, baseName);
+
+            if (sketchTool_ == SketchTool::Line) {
+                baseName = "SketchLine";
+            }
+            if (sketchTool_ == SketchTool::Rectangle) {
+                baseName = "SketchRect";
+            }
+            if (sketchTool_ == SketchTool::Circle) {
+                baseName = "SketchCircle";
+            }
+
+            sketchCommittedCallback_(
+                shape,
+                baseName);
         }
 
         clearPreview();
@@ -870,25 +1019,47 @@ private:
         }
     }
 
-    void updateSketchPreview(const gp_Pnt& point)
+    void updateSketchPreview(
+        const gp_Pnt& point)
     {
-        TopoDS_Shape preview =
-            makeSketchShape(firstSketchPoint_, point, false);
-
         clearPreview();
-        if (preview.IsNull()) {
-            return;
-        }
 
-        previewPresentation_ = new AIS_Shape(preview);
-        previewPresentation_->SetColor(
-            Quantity_Color(0.20, 0.75, 1.0, Quantity_TOC_RGB));
-        context_->Display(previewPresentation_, false);
-        context_->SetDisplayMode(
-            previewPresentation_,
-            AIS_WireFrame,
-            false);
-        context_->UpdateCurrentViewer();
+        try {
+            TopoDS_Shape preview =
+                makeSketchShape(
+                    firstSketchPoint_,
+                    point,
+                    false);
+
+            if (preview.IsNull()) {
+                return;
+            }
+
+            previewPresentation_ =
+                new AIS_Shape(preview);
+
+            previewPresentation_->SetColor(
+                Quantity_Color(
+                    0.20,
+                    0.75,
+                    1.0,
+                    Quantity_TOC_RGB));
+
+            context_->Display(
+                previewPresentation_,
+                false);
+
+            context_->SetDisplayMode(
+                previewPresentation_,
+                AIS_WireFrame,
+                false);
+
+            context_->UpdateCurrentViewer();
+        } catch (const Standard_Failure&) {
+            clearPreview();
+        } catch (...) {
+            clearPreview();
+        }
     }
 
     void setSketchGridVisible(bool visible)
@@ -975,6 +1146,7 @@ private:
     std::function<void(const TopoDS_Shape&, const QString&)> sketchCommittedCallback_;
     std::function<void()> cancelCallback_;
     std::function<void(double, double)> sketchPositionCallback_;
+    std::function<void(const QString&)> sketchErrorCallback_;
 
     bool sketchSessionActive_ = false;
     bool snapEnabled_ = true;
@@ -994,7 +1166,7 @@ class MainWindow final : public QMainWindow
 public:
     MainWindow()
     {
-        setWindowTitle("MyCAD V0.4.4 Viewport Startup Fix");
+        setWindowTitle("MyCAD V0.4.5 Sketch Crash Fix");
         resize(1500, 920);
 
         view_ = new CadView(this);
@@ -1031,6 +1203,17 @@ public:
                         QString("U: %1 mm    V: %2 mm")
                             .arg(u, 0, 'f', 2)
                             .arg(v, 0, 'f', 2));
+                }
+            });
+        view_->setSketchErrorCallback(
+            [this](const QString& message) {
+                statusBar()->showMessage(
+                    message,
+                    5000);
+
+                if (taskKind_ == TaskKind::Sketch &&
+                    taskHelpLabel_ != nullptr) {
+                    taskHelpLabel_->setText(message);
                 }
             });
 
@@ -2094,7 +2277,7 @@ private:
         objects_.clear();
         view_->clearScene();
         objectCounter_ = 0;
-        setWindowTitle("MyCAD V0.4.4 Viewport Startup Fix");
+        setWindowTitle("MyCAD V0.4.5 Sketch Crash Fix");
         rebuildTree();
         updateProperties();
     }
@@ -4113,7 +4296,7 @@ int main(int argc, char* argv[])
     QApplication app(argc, argv);
     app.setApplicationName("MyCAD");
     app.setOrganizationName("MyCAD Project");
-    app.setApplicationVersion("0.4.4");
+    app.setApplicationVersion("0.4.5");
 
     MainWindow window;
     window.show();
