@@ -19,10 +19,12 @@
 #include <QPaintEngine>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QShowEvent>
 #include <QSignalBlocker>
 #include <QStatusBar>
 #include <QTabWidget>
 #include <QTableWidget>
+#include <QTimer>
 #include <QToolBar>
 #include <QTreeWidget>
 #include <QTreeWidgetItemIterator>
@@ -443,8 +445,30 @@ public:
         if (!view_.IsNull()) {
             view_->FitAll(0.01, false);
             view_->ZFitAll();
+            view_->Redraw();
             update();
         }
+    }
+
+    void synchronizeViewport(bool fit = false)
+    {
+        if (view_.IsNull()) {
+            return;
+        }
+
+        view_->MustBeResized();
+
+        if (fit) {
+            view_->FitAll(0.01, false);
+            view_->ZFitAll();
+        }
+
+        if (!context_.IsNull()) {
+            context_->UpdateCurrentViewer();
+        }
+
+        view_->Redraw();
+        update();
     }
 
     void viewAxo()
@@ -502,10 +526,32 @@ protected:
         }
     }
 
-    void resizeEvent(QResizeEvent*) override
+    void showEvent(QShowEvent* event) override
     {
+        QWidget::showEvent(event);
+
+        QTimer::singleShot(
+            0,
+            this,
+            [this]() {
+                synchronizeViewport(true);
+            });
+
+        QTimer::singleShot(
+            120,
+            this,
+            [this]() {
+                synchronizeViewport(true);
+            });
+    }
+
+    void resizeEvent(QResizeEvent* event) override
+    {
+        QWidget::resizeEvent(event);
+
         if (!view_.IsNull()) {
             view_->MustBeResized();
+            view_->Redraw();
             update();
         }
     }
@@ -948,7 +994,7 @@ class MainWindow final : public QMainWindow
 public:
     MainWindow()
     {
-        setWindowTitle("MyCAD V0.4.3 CATIA Measure");
+        setWindowTitle("MyCAD V0.4.4 Viewport Startup Fix");
         resize(1500, 920);
 
         view_ = new CadView(this);
@@ -2048,7 +2094,7 @@ private:
         objects_.clear();
         view_->clearScene();
         objectCounter_ = 0;
-        setWindowTitle("MyCAD V0.4.3 CATIA Measure");
+        setWindowTitle("MyCAD V0.4.4 Viewport Startup Fix");
         rebuildTree();
         updateProperties();
     }
@@ -4067,10 +4113,36 @@ int main(int argc, char* argv[])
     QApplication app(argc, argv);
     app.setApplicationName("MyCAD");
     app.setOrganizationName("MyCAD Project");
-    app.setApplicationVersion("0.4.3");
+    app.setApplicationVersion("0.4.4");
 
     MainWindow window;
     window.show();
+
+    QTimer::singleShot(
+        0,
+        &window,
+        [&window]() {
+            auto* cadView =
+                qobject_cast<CadView*>(
+                    window.centralWidget());
+
+            if (cadView != nullptr) {
+                cadView->synchronizeViewport(true);
+            }
+        });
+
+    QTimer::singleShot(
+        180,
+        &window,
+        [&window]() {
+            auto* cadView =
+                qobject_cast<CadView*>(
+                    window.centralWidget());
+
+            if (cadView != nullptr) {
+                cadView->synchronizeViewport(true);
+            }
+        });
 
     return app.exec();
 }
