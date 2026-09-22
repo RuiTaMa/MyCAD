@@ -8,6 +8,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHeaderView>
+#include <QHBoxLayout>
 #include <QInputDialog>
 #include <QKeyEvent>
 #include <QLabel>
@@ -35,10 +36,14 @@
 #include <Aspect_DisplayConnection.hxx>
 #include <Bnd_Box.hxx>
 #include <BRep_Builder.hxx>
+#include <BRep_Tool.hxx>
+#include <BRepAdaptor_Curve.hxx>
+#include <BRepAdaptor_Surface.hxx>
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepBndLib.hxx>
+#include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
@@ -55,6 +60,8 @@
 #include <BRepPrimAPI_MakeSphere.hxx>
 #include <BRepPrimAPI_MakeTorus.hxx>
 #include <BRepTools.hxx>
+#include <GeomAbs_CurveType.hxx>
+#include <GeomAbs_SurfaceType.hxx>
 #include <GProp_GProps.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <IGESControl_Reader.hxx>
@@ -73,6 +80,7 @@
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
+#include <TopoDS_Vertex.hxx>
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Wire.hxx>
 #include <V3d_TypeOfOrientation.hxx>
@@ -82,7 +90,9 @@
 #include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Circ.hxx>
+#include <gp_Cylinder.hxx>
 #include <gp_Dir.hxx>
+#include <gp_Mat.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
@@ -124,6 +134,14 @@ static QString datumPlaneName(DatumPlane plane)
     return QString();
 }
 
+enum class MeasureMode
+{
+    None,
+    Item,
+    Between,
+    Inertia
+};
+
 class CadView final : public QWidget
 {
 public:
@@ -157,6 +175,12 @@ public:
         std::function<void(const Handle(AIS_InteractiveObject)&)> callback)
     {
         selectionCallback_ = std::move(callback);
+    }
+
+    void setShapeSelectionCallback(
+        std::function<void(const TopoDS_Shape&)> callback)
+    {
+        shapeSelectionCallback_ = std::move(callback);
     }
 
     void setSketchCommittedCallback(
@@ -269,6 +293,84 @@ public:
             }
         }
         context_->UpdateCurrentViewer();
+    }
+
+    void setShapeSelectionModes(
+        const std::vector<ModelObject>& objects,
+        const std::vector<TopAbs_ShapeEnum>& types)
+    {
+        context_->ClearSelected(false);
+
+        for (const auto& obj : objects) {
+            if (obj.presentation.IsNull() || !obj.visible) {
+                continue;
+            }
+
+            context_->Deactivate(obj.presentation);
+
+            for (const TopAbs_ShapeEnum type : types) {
+                context_->Activate(
+                    obj.presentation,
+                    AIS_Shape::SelectionMode(type),
+                    true);
+            }
+        }
+
+        context_->UpdateCurrentViewer();
+    }
+
+    void restoreObjectSelection(
+        const std::vector<ModelObject>& objects)
+    {
+        context_->ClearSelected(false);
+
+        for (const auto& obj : objects) {
+            if (obj.presentation.IsNull() || !obj.visible) {
+                continue;
+            }
+
+            context_->Deactivate(obj.presentation);
+            context_->Activate(
+                obj.presentation,
+                AIS_Shape::SelectionMode(TopAbs_SHAPE),
+                true);
+        }
+
+        context_->UpdateCurrentViewer();
+    }
+
+    void showMeasurementSegment(
+        const gp_Pnt& first,
+        const gp_Pnt& second)
+    {
+        clearMeasurementOverlay();
+
+        if (first.Distance(second) <= 1.0e-9) {
+            return;
+        }
+
+        TopoDS_Edge edge =
+            BRepBuilderAPI_MakeEdge(first, second).Edge();
+        measurementPresentation_ = new AIS_Shape(edge);
+        measurementPresentation_->SetColor(
+            Quantity_Color(0.95, 0.20, 0.15, Quantity_TOC_RGB));
+        context_->Display(measurementPresentation_, false);
+        context_->SetDisplayMode(
+            measurementPresentation_,
+            AIS_WireFrame,
+            false);
+        context_->UpdateCurrentViewer();
+    }
+
+    void clearMeasurementOverlay()
+    {
+        if (!measurementPresentation_.IsNull()) {
+            context_->Remove(
+                measurementPresentation_,
+                false);
+            measurementPresentation_.Nullify();
+            context_->UpdateCurrentViewer();
+        }
     }
 
     Handle(AIS_Shape) displayShape(
@@ -436,16 +538,32 @@ protected:
             rotating_ = true;
             view_->StartRotation(lastMousePos_.x(), lastMousePos_.y());
         } else if (event->button() == Qt::LeftButton) {
-            context_->MoveTo(lastMousePos_.x(), lastMousePos_.y(), view_, true);
+            context_->MoveTo(
+                lastMousePos_.x(),
+                lastMousePos_.y(),
+                view_,
+                true);
             context_->SelectDetected();
 
-            if (selectionCallback_) {
-                Handle(AIS_InteractiveObject) selected;
-                context_->InitSelected();
-                if (context_->MoreSelected()) {
-                    selected = context_->SelectedInteractive();
+            Handle(AIS_InteractiveObject) selected;
+            TopoDS_Shape selectedShape;
+
+            context_->InitSelected();
+            if (context_->MoreSelected()) {
+                selected = context_->SelectedInteractive();
+
+                if (context_->HasSelectedShape()) {
+                    selectedShape = context_->SelectedShape();
                 }
+            }
+
+            if (selectionCallback_) {
                 selectionCallback_(selected);
+            }
+
+            if (shapeSelectionCallback_ &&
+                !selectedShape.IsNull()) {
+                shapeSelectionCallback_(selectedShape);
             }
         }
 
@@ -804,8 +922,10 @@ private:
 
     Handle(AIS_Shape) previewPresentation_;
     Handle(AIS_Shape) gridPresentation_;
+    Handle(AIS_Shape) measurementPresentation_;
 
     std::function<void(const Handle(AIS_InteractiveObject)&)> selectionCallback_;
+    std::function<void(const TopoDS_Shape&)> shapeSelectionCallback_;
     std::function<void(const TopoDS_Shape&, const QString&)> sketchCommittedCallback_;
     std::function<void()> cancelCallback_;
     std::function<void(double, double)> sketchPositionCallback_;
@@ -828,7 +948,7 @@ class MainWindow final : public QMainWindow
 public:
     MainWindow()
     {
-        setWindowTitle("MyCAD V0.4.2 Unicode Path Fix");
+        setWindowTitle("MyCAD V0.4.3 CATIA Measure");
         resize(1500, 920);
 
         view_ = new CadView(this);
@@ -837,6 +957,10 @@ public:
         view_->setSelectionCallback(
             [this](const Handle(AIS_InteractiveObject)& selected) {
                 syncTreeFromViewport(selected);
+            });
+        view_->setShapeSelectionCallback(
+            [this](const TopoDS_Shape& shape) {
+                handleMeasurementPick(shape);
             });
         view_->setSketchCommittedCallback(
             [this](const TopoDS_Shape& shape, const QString& baseName) {
@@ -866,6 +990,7 @@ public:
 
         buildModelDock();
         buildPropertyDock();
+        buildMeasurementDock();
         buildMenus();
 
         statusBar()->showMessage(
@@ -1024,6 +1149,96 @@ private:
         addDockWidget(Qt::RightDockWidgetArea, propertyDock_);
 
         showTaskIdle();
+    }
+
+    void buildMeasurementDock()
+    {
+        measureDock_ =
+            new QDockWidget(QString::fromUtf8("測量"), this);
+
+        auto* page = new QWidget(measureDock_);
+        auto* layout = new QVBoxLayout(page);
+
+        measureModeTitle_ =
+            new QLabel(QString::fromUtf8("沒有進行中的量測"), page);
+        QFont titleFont = measureModeTitle_->font();
+        titleFont.setBold(true);
+        titleFont.setPointSize(titleFont.pointSize() + 1);
+        measureModeTitle_->setFont(titleFont);
+
+        measureHelpLabel_ =
+            new QLabel(
+                QString::fromUtf8(
+                    "選擇 Measure Item、Measure Between 或 Measure Inertia。"),
+                page);
+        measureHelpLabel_->setWordWrap(true);
+
+        measureFilterCombo_ = new QComboBox(page);
+        measureFilterCombo_->addItems({
+            QString::fromUtf8("全部元素"),
+            QString::fromUtf8("僅限邊線"),
+            QString::fromUtf8("僅限面"),
+            QString::fromUtf8("僅限點"),
+            QString::fromUtf8("僅限實體")
+        });
+
+        measureTable_ = new QTableWidget(page);
+        measureTable_->setColumnCount(2);
+        measureTable_->setHorizontalHeaderLabels({
+            QString::fromUtf8("量測項目"),
+            QString::fromUtf8("結果")
+        });
+        measureTable_->horizontalHeader()->setStretchLastSection(true);
+        measureTable_->verticalHeader()->setVisible(false);
+        measureTable_->setEditTriggers(
+            QAbstractItemView::NoEditTriggers);
+
+        auto* buttonRow = new QHBoxLayout();
+        auto* resetButton =
+            new QPushButton(QString::fromUtf8("重設"), page);
+        auto* closeButton =
+            new QPushButton(QString::fromUtf8("關閉"), page);
+        buttonRow->addWidget(resetButton);
+        buttonRow->addWidget(closeButton);
+
+        layout->addWidget(measureModeTitle_);
+        layout->addWidget(measureHelpLabel_);
+        layout->addWidget(
+            new QLabel(QString::fromUtf8("選取模式"), page));
+        layout->addWidget(measureFilterCombo_);
+        layout->addWidget(measureTable_, 1);
+        layout->addLayout(buttonRow);
+
+        connect(
+            measureFilterCombo_,
+            &QComboBox::currentIndexChanged,
+            this,
+            [this](int) {
+                if (measureMode_ != MeasureMode::None) {
+                    applyMeasurementSelectionFilter();
+                }
+            });
+
+        connect(
+            resetButton,
+            &QPushButton::clicked,
+            this,
+            [this]() {
+                resetMeasurement();
+            });
+
+        connect(
+            closeButton,
+            &QPushButton::clicked,
+            this,
+            [this]() {
+                endMeasurement();
+            });
+
+        measureDock_->setWidget(page);
+        addDockWidget(Qt::RightDockWidgetArea, measureDock_);
+        tabifyDockWidget(propertyDock_, measureDock_);
+        measureDock_->hide();
     }
 
     void buildMenus()
@@ -1234,10 +1449,49 @@ private:
         transformMenu->addSeparator();
         transformMenu->addActions({mirrorXYAct, mirrorYZAct, mirrorXZAct});
 
-        QAction* measureAct =
-            new QAction(QString::fromUtf8("幾何資訊"), this);
-        connect(measureAct, &QAction::triggered, this, [this]() { showMeasurement(); });
-        measureMenu->addAction(measureAct);
+        QAction* measureItemAct =
+            new QAction(
+                QString::fromUtf8("Measure Item｜測量項目"),
+                this);
+        QAction* measureBetweenAct =
+            new QAction(
+                QString::fromUtf8("Measure Between｜測量兩者"),
+                this);
+        QAction* measureInertiaAct =
+            new QAction(
+                QString::fromUtf8("Measure Inertia｜慣性/質量屬性"),
+                this);
+
+        connect(
+            measureItemAct,
+            &QAction::triggered,
+            this,
+            [this]() { startMeasureItem(); });
+        connect(
+            measureBetweenAct,
+            &QAction::triggered,
+            this,
+            [this]() { startMeasureBetween(); });
+        connect(
+            measureInertiaAct,
+            &QAction::triggered,
+            this,
+            [this]() { startMeasureInertia(); });
+
+        measureMenu->addActions({
+            measureItemAct,
+            measureBetweenAct,
+            measureInertiaAct
+        });
+
+        measureBar_ =
+            addToolBar(QString::fromUtf8("測量"));
+        measureBar_->setMovable(false);
+        measureBar_->addActions({
+            measureItemAct,
+            measureBetweenAct,
+            measureInertiaAct
+        });
 
         QAction* axoAct = new QAction(QString::fromUtf8("等角"), this);
         QAction* topAct = new QAction(QString::fromUtf8("上視"), this);
@@ -1794,7 +2048,7 @@ private:
         objects_.clear();
         view_->clearScene();
         objectCounter_ = 0;
-        setWindowTitle("MyCAD V0.4.2 Unicode Path Fix");
+        setWindowTitle("MyCAD V0.4.3 CATIA Measure");
         rebuildTree();
         updateProperties();
     }
@@ -2790,6 +3044,574 @@ private:
         propertyTable_->setItem(row, 1, new QTableWidgetItem(value));
     }
 
+    void clearMeasurementTable()
+    {
+        measureTable_->setRowCount(0);
+    }
+
+    void addMeasurementRow(
+        const QString& name,
+        const QString& value)
+    {
+        const int row = measureTable_->rowCount();
+        measureTable_->insertRow(row);
+        measureTable_->setItem(
+            row, 0, new QTableWidgetItem(name));
+        measureTable_->setItem(
+            row, 1, new QTableWidgetItem(value));
+    }
+
+    QString measurementShapeName(
+        const TopoDS_Shape& shape) const
+    {
+        switch (shape.ShapeType()) {
+        case TopAbs_VERTEX:
+            return QString::fromUtf8("點");
+        case TopAbs_EDGE:
+            return QString::fromUtf8("邊");
+        case TopAbs_WIRE:
+            return QString::fromUtf8("線框");
+        case TopAbs_FACE:
+            return QString::fromUtf8("面");
+        case TopAbs_SHELL:
+            return QString::fromUtf8("殼");
+        case TopAbs_SOLID:
+            return QString::fromUtf8("實體");
+        case TopAbs_COMPSOLID:
+            return QString::fromUtf8("複合實體");
+        case TopAbs_COMPOUND:
+            return QString::fromUtf8("複合物件");
+        default:
+            return QString::fromUtf8("幾何");
+        }
+    }
+
+    void configureMeasurementPanel(
+        const QString& title,
+        const QString& help)
+    {
+        clearMeasurementTable();
+        view_->clearMeasurementOverlay();
+        measureFirstShape_.Nullify();
+        measureSecondShape_.Nullify();
+
+        measureModeTitle_->setText(title);
+        measureHelpLabel_->setText(help);
+
+        measureDock_->show();
+        measureDock_->raise();
+    }
+
+    void startMeasureItem()
+    {
+        cancelTask();
+        endMeasurement(false);
+
+        measureMode_ = MeasureMode::Item;
+        configureMeasurementPanel(
+            QString::fromUtf8("Measure Item"),
+            QString::fromUtf8(
+                "直接在 3D 視窗點選幾何。可切換「僅限邊線 / 面 / 點 / 實體」。\n"
+                "圓邊會顯示半徑與直徑，邊線會顯示長度。"));
+
+        measureFilterCombo_->setCurrentIndex(1);
+        applyMeasurementSelectionFilter();
+        statusBar()->showMessage(
+            QString::fromUtf8(
+                "Measure Item：請在模型上點選要量測的幾何。"));
+    }
+
+    void startMeasureBetween()
+    {
+        cancelTask();
+        endMeasurement(false);
+
+        measureMode_ = MeasureMode::Between;
+        configureMeasurementPanel(
+            QString::fromUtf8("Measure Between"),
+            QString::fromUtf8(
+                "依序選取兩個幾何元素，計算最短距離、ΔX、ΔY、ΔZ，"
+                "若為兩條直線或兩個平面也會顯示夾角。"));
+
+        measureFilterCombo_->setCurrentIndex(0);
+        applyMeasurementSelectionFilter();
+        statusBar()->showMessage(
+            QString::fromUtf8(
+                "Measure Between：請選取第一個元素。"));
+    }
+
+    void startMeasureInertia()
+    {
+        cancelTask();
+        endMeasurement(false);
+
+        measureMode_ = MeasureMode::Inertia;
+        configureMeasurementPanel(
+            QString::fromUtf8("Measure Inertia"),
+            QString::fromUtf8(
+                "選取一個實體，顯示體積、表面積、重心與慣性矩陣。"));
+
+        measureFilterCombo_->setCurrentIndex(4);
+        applyMeasurementSelectionFilter();
+        statusBar()->showMessage(
+            QString::fromUtf8(
+                "Measure Inertia：請選取一個實體。"));
+    }
+
+    void applyMeasurementSelectionFilter()
+    {
+        if (measureMode_ == MeasureMode::None) {
+            return;
+        }
+
+        std::vector<TopAbs_ShapeEnum> types;
+
+        switch (measureFilterCombo_->currentIndex()) {
+        case 1:
+            types = {TopAbs_EDGE};
+            break;
+        case 2:
+            types = {TopAbs_FACE};
+            break;
+        case 3:
+            types = {TopAbs_VERTEX};
+            break;
+        case 4:
+            types = {TopAbs_SOLID};
+            break;
+        default:
+            types = {
+                TopAbs_VERTEX,
+                TopAbs_EDGE,
+                TopAbs_FACE,
+                TopAbs_SOLID
+            };
+            break;
+        }
+
+        view_->setShapeSelectionModes(objects_, types);
+    }
+
+    void resetMeasurement()
+    {
+        clearMeasurementTable();
+        measureFirstShape_.Nullify();
+        measureSecondShape_.Nullify();
+        view_->clearMeasurementOverlay();
+
+        if (measureMode_ == MeasureMode::Between) {
+            measureHelpLabel_->setText(
+                QString::fromUtf8(
+                    "依序選取兩個幾何元素。"));
+            statusBar()->showMessage(
+                QString::fromUtf8(
+                    "Measure Between：請選取第一個元素。"));
+        }
+    }
+
+    void endMeasurement(bool hideDock = true)
+    {
+        measureMode_ = MeasureMode::None;
+        measureFirstShape_.Nullify();
+        measureSecondShape_.Nullify();
+        view_->clearMeasurementOverlay();
+        view_->restoreObjectSelection(objects_);
+
+        if (hideDock && measureDock_ != nullptr) {
+            measureDock_->hide();
+        }
+    }
+
+    void handleMeasurementPick(
+        const TopoDS_Shape& shape)
+    {
+        if (measureMode_ == MeasureMode::None ||
+            shape.IsNull()) {
+            return;
+        }
+
+        if (measureMode_ == MeasureMode::Item) {
+            showMeasureItem(shape);
+            return;
+        }
+
+        if (measureMode_ == MeasureMode::Inertia) {
+            showMeasureInertia(shape);
+            return;
+        }
+
+        if (measureMode_ == MeasureMode::Between) {
+            if (measureFirstShape_.IsNull()) {
+                measureFirstShape_ = shape;
+                clearMeasurementTable();
+                addMeasurementRow(
+                    QString::fromUtf8("元素 1"),
+                    measurementShapeName(shape));
+                measureHelpLabel_->setText(
+                    QString::fromUtf8(
+                        "第一個元素已選取，請選第二個元素。"));
+                statusBar()->showMessage(
+                    QString::fromUtf8(
+                        "Measure Between：請選取第二個元素。"));
+                return;
+            }
+
+            measureSecondShape_ = shape;
+            showMeasureBetween(
+                measureFirstShape_,
+                measureSecondShape_);
+        }
+    }
+
+    void showMeasureItem(
+        const TopoDS_Shape& shape)
+    {
+        clearMeasurementTable();
+        view_->clearMeasurementOverlay();
+
+        addMeasurementRow(
+            QString::fromUtf8("類型"),
+            measurementShapeName(shape));
+
+        if (shape.ShapeType() == TopAbs_VERTEX) {
+            const gp_Pnt p =
+                BRep_Tool::Pnt(TopoDS::Vertex(shape));
+
+            addMeasurementRow(
+                "X (mm)",
+                QString::number(p.X(), 'f', 3));
+            addMeasurementRow(
+                "Y (mm)",
+                QString::number(p.Y(), 'f', 3));
+            addMeasurementRow(
+                "Z (mm)",
+                QString::number(p.Z(), 'f', 3));
+            return;
+        }
+
+        if (shape.ShapeType() == TopAbs_EDGE ||
+            shape.ShapeType() == TopAbs_WIRE) {
+            GProp_GProps props;
+            BRepGProp::LinearProperties(shape, props);
+
+            addMeasurementRow(
+                QString::fromUtf8("長度 (mm)"),
+                QString::number(
+                    props.Mass(), 'f', 3));
+        }
+
+        if (shape.ShapeType() == TopAbs_EDGE) {
+            try {
+                BRepAdaptor_Curve curve(
+                    TopoDS::Edge(shape));
+
+                if (curve.GetType() == GeomAbs_Circle) {
+                    const gp_Circ circle =
+                        curve.Circle();
+                    const gp_Pnt center =
+                        circle.Location();
+
+                    addMeasurementRow(
+                        QString::fromUtf8("半徑 R (mm)"),
+                        QString::number(
+                            circle.Radius(), 'f', 3));
+                    addMeasurementRow(
+                        QString::fromUtf8("直徑 Ø (mm)"),
+                        QString::number(
+                            circle.Radius() * 2.0,
+                            'f',
+                            3));
+                    addMeasurementRow(
+                        QString::fromUtf8("圓心 X"),
+                        QString::number(
+                            center.X(), 'f', 3));
+                    addMeasurementRow(
+                        QString::fromUtf8("圓心 Y"),
+                        QString::number(
+                            center.Y(), 'f', 3));
+                    addMeasurementRow(
+                        QString::fromUtf8("圓心 Z"),
+                        QString::number(
+                            center.Z(), 'f', 3));
+                }
+            } catch (const Standard_Failure&) {
+            }
+        }
+
+        if (shape.ShapeType() == TopAbs_FACE) {
+            GProp_GProps areaProps;
+            BRepGProp::SurfaceProperties(
+                shape,
+                areaProps);
+
+            addMeasurementRow(
+                QString::fromUtf8("面積 (mm²)"),
+                QString::number(
+                    areaProps.Mass(), 'f', 3));
+
+            try {
+                BRepAdaptor_Surface surface(
+                    TopoDS::Face(shape));
+
+                if (surface.GetType() ==
+                    GeomAbs_Cylinder) {
+                    const gp_Cylinder cylinder =
+                        surface.Cylinder();
+
+                    addMeasurementRow(
+                        QString::fromUtf8(
+                            "圓柱半徑 R (mm)"),
+                        QString::number(
+                            cylinder.Radius(),
+                            'f',
+                            3));
+                    addMeasurementRow(
+                        QString::fromUtf8(
+                            "圓柱直徑 Ø (mm)"),
+                        QString::number(
+                            cylinder.Radius() * 2.0,
+                            'f',
+                            3));
+                }
+            } catch (const Standard_Failure&) {
+            }
+        }
+
+        if (shape.ShapeType() == TopAbs_SOLID ||
+            shape.ShapeType() == TopAbs_COMPSOLID ||
+            shape.ShapeType() == TopAbs_COMPOUND) {
+            GProp_GProps volumeProps;
+            GProp_GProps areaProps;
+            BRepGProp::VolumeProperties(
+                shape,
+                volumeProps);
+            BRepGProp::SurfaceProperties(
+                shape,
+                areaProps);
+
+            addMeasurementRow(
+                QString::fromUtf8("體積 (mm³)"),
+                QString::number(
+                    volumeProps.Mass(), 'f', 3));
+            addMeasurementRow(
+                QString::fromUtf8("表面積 (mm²)"),
+                QString::number(
+                    areaProps.Mass(), 'f', 3));
+        }
+
+        Bnd_Box box;
+        BRepBndLib::Add(shape, box);
+        if (!box.IsVoid()) {
+            double xmin, ymin, zmin, xmax, ymax, zmax;
+            box.Get(
+                xmin, ymin, zmin,
+                xmax, ymax, zmax);
+
+            addMeasurementRow(
+                QString::fromUtf8("包圍尺寸 X"),
+                QString::number(
+                    xmax - xmin, 'f', 3));
+            addMeasurementRow(
+                QString::fromUtf8("包圍尺寸 Y"),
+                QString::number(
+                    ymax - ymin, 'f', 3));
+            addMeasurementRow(
+                QString::fromUtf8("包圍尺寸 Z"),
+                QString::number(
+                    zmax - zmin, 'f', 3));
+        }
+    }
+
+    void showMeasureBetween(
+        const TopoDS_Shape& first,
+        const TopoDS_Shape& second)
+    {
+        clearMeasurementTable();
+
+        BRepExtrema_DistShapeShape distance(
+            first,
+            second);
+        distance.Perform();
+
+        if (!distance.IsDone() ||
+            distance.NbSolution() < 1) {
+            addMeasurementRow(
+                QString::fromUtf8("結果"),
+                QString::fromUtf8("無法計算距離"));
+            return;
+        }
+
+        const double value = distance.Value();
+        const gp_Pnt p1 =
+            distance.PointOnShape1(1);
+        const gp_Pnt p2 =
+            distance.PointOnShape2(1);
+
+        addMeasurementRow(
+            QString::fromUtf8("元素 1"),
+            measurementShapeName(first));
+        addMeasurementRow(
+            QString::fromUtf8("元素 2"),
+            measurementShapeName(second));
+        addMeasurementRow(
+            QString::fromUtf8("最短距離 (mm)"),
+            QString::number(value, 'f', 3));
+        addMeasurementRow(
+            "ΔX (mm)",
+            QString::number(
+                std::abs(p2.X() - p1.X()),
+                'f',
+                3));
+        addMeasurementRow(
+            "ΔY (mm)",
+            QString::number(
+                std::abs(p2.Y() - p1.Y()),
+                'f',
+                3));
+        addMeasurementRow(
+            "ΔZ (mm)",
+            QString::number(
+                std::abs(p2.Z() - p1.Z()),
+                'f',
+                3));
+
+        if (first.ShapeType() == TopAbs_EDGE &&
+            second.ShapeType() == TopAbs_EDGE) {
+            try {
+                BRepAdaptor_Curve c1(
+                    TopoDS::Edge(first));
+                BRepAdaptor_Curve c2(
+                    TopoDS::Edge(second));
+
+                if (c1.GetType() == GeomAbs_Line &&
+                    c2.GetType() == GeomAbs_Line) {
+                    double angle =
+                        c1.Line().Direction().Angle(
+                            c2.Line().Direction());
+                    angle =
+                        angle * 180.0 /
+                        std::acos(-1.0);
+
+                    if (angle > 90.0) {
+                        angle = 180.0 - angle;
+                    }
+
+                    addMeasurementRow(
+                        QString::fromUtf8("夾角 (deg)"),
+                        QString::number(
+                            angle, 'f', 3));
+                }
+            } catch (const Standard_Failure&) {
+            }
+        }
+
+        if (first.ShapeType() == TopAbs_FACE &&
+            second.ShapeType() == TopAbs_FACE) {
+            try {
+                BRepAdaptor_Surface s1(
+                    TopoDS::Face(first));
+                BRepAdaptor_Surface s2(
+                    TopoDS::Face(second));
+
+                if (s1.GetType() == GeomAbs_Plane &&
+                    s2.GetType() == GeomAbs_Plane) {
+                    double angle =
+                        s1.Plane().Axis().Direction().Angle(
+                            s2.Plane().Axis().Direction());
+                    angle =
+                        angle * 180.0 /
+                        std::acos(-1.0);
+
+                    if (angle > 90.0) {
+                        angle = 180.0 - angle;
+                    }
+
+                    addMeasurementRow(
+                        QString::fromUtf8(
+                            "平面夾角 (deg)"),
+                        QString::number(
+                            angle, 'f', 3));
+                }
+            } catch (const Standard_Failure&) {
+            }
+        }
+
+        view_->showMeasurementSegment(p1, p2);
+        measureHelpLabel_->setText(
+            QString::fromUtf8(
+                "量測完成。按「重設」可重新選取兩個元素。"));
+        statusBar()->showMessage(
+            QString::fromUtf8(
+                "Measure Between：量測完成。"));
+    }
+
+    void showMeasureInertia(
+        const TopoDS_Shape& shape)
+    {
+        clearMeasurementTable();
+        view_->clearMeasurementOverlay();
+
+        GProp_GProps volumeProps;
+        GProp_GProps areaProps;
+
+        BRepGProp::VolumeProperties(
+            shape,
+            volumeProps);
+        BRepGProp::SurfaceProperties(
+            shape,
+            areaProps);
+
+        const gp_Pnt center =
+            volumeProps.CentreOfMass();
+        const gp_Mat inertia =
+            volumeProps.MatrixOfInertia();
+
+        addMeasurementRow(
+            QString::fromUtf8("體積 (mm³)"),
+            QString::number(
+                volumeProps.Mass(), 'f', 3));
+        addMeasurementRow(
+            QString::fromUtf8("表面積 (mm²)"),
+            QString::number(
+                areaProps.Mass(), 'f', 3));
+        addMeasurementRow(
+            QString::fromUtf8("重心 X (mm)"),
+            QString::number(
+                center.X(), 'f', 3));
+        addMeasurementRow(
+            QString::fromUtf8("重心 Y (mm)"),
+            QString::number(
+                center.Y(), 'f', 3));
+        addMeasurementRow(
+            QString::fromUtf8("重心 Z (mm)"),
+            QString::number(
+                center.Z(), 'f', 3));
+        addMeasurementRow(
+            "Ixx",
+            QString::number(
+                inertia.Value(1, 1), 'f', 3));
+        addMeasurementRow(
+            "Iyy",
+            QString::number(
+                inertia.Value(2, 2), 'f', 3));
+        addMeasurementRow(
+            "Izz",
+            QString::number(
+                inertia.Value(3, 3), 'f', 3));
+        addMeasurementRow(
+            "Ixy",
+            QString::number(
+                inertia.Value(1, 2), 'f', 3));
+        addMeasurementRow(
+            "Ixz",
+            QString::number(
+                inertia.Value(1, 3), 'f', 3));
+        addMeasurementRow(
+            "Iyz",
+            QString::number(
+                inertia.Value(2, 3), 'f', 3));
+    }
+
     void showMeasurement()
     {
         const auto indices = selectedIndices();
@@ -3202,6 +4024,7 @@ private:
     QToolBar* sketchBar_ = nullptr;
     QToolBar* modelBar_ = nullptr;
     QToolBar* viewBar_ = nullptr;
+    QToolBar* measureBar_ = nullptr;
 
     QDockWidget* propertyDock_ = nullptr;
     QTabWidget* propertyTabs_ = nullptr;
@@ -3217,6 +4040,16 @@ private:
     QPushButton* taskApplyButton_ = nullptr;
     QPushButton* taskCancelButton_ = nullptr;
     QTableWidget* propertyTable_ = nullptr;
+
+    QDockWidget* measureDock_ = nullptr;
+    QLabel* measureModeTitle_ = nullptr;
+    QLabel* measureHelpLabel_ = nullptr;
+    QComboBox* measureFilterCombo_ = nullptr;
+    QTableWidget* measureTable_ = nullptr;
+
+    MeasureMode measureMode_ = MeasureMode::None;
+    TopoDS_Shape measureFirstShape_;
+    TopoDS_Shape measureSecondShape_;
 
     TaskKind taskKind_ = TaskKind::None;
     DatumPlane activeSketchPlane_ = DatumPlane::None;
@@ -3234,7 +4067,7 @@ int main(int argc, char* argv[])
     QApplication app(argc, argv);
     app.setApplicationName("MyCAD");
     app.setOrganizationName("MyCAD Project");
-    app.setApplicationVersion("0.4.2");
+    app.setApplicationVersion("0.4.3");
 
     MainWindow window;
     window.show();
