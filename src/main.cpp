@@ -167,6 +167,34 @@ public:
         cancelCallback_ = std::move(callback);
     }
 
+    void setSketchPositionCallback(
+        std::function<void(double, double)> callback)
+    {
+        sketchPositionCallback_ = std::move(callback);
+    }
+
+    void setSketchTool(SketchTool tool)
+    {
+        clearPreview();
+        hasFirstSketchPoint_ = false;
+        sketchTool_ = tool;
+        setFocus(Qt::OtherFocusReason);
+    }
+
+    void setSketchSnap(bool enabled, double step)
+    {
+        snapEnabled_ = enabled;
+        snapStep_ = std::max(0.001, step);
+
+        if (sketchSessionActive_) {
+            if (!gridPresentation_.IsNull()) {
+                context_->Remove(gridPresentation_, false);
+                gridPresentation_.Nullify();
+            }
+            setSketchGridVisible(true);
+        }
+    }
+
     void beginSketchTool(SketchTool tool, DatumPlane plane)
     {
         clearPreview();
@@ -177,6 +205,7 @@ public:
         }
 
         currentSketchPlane_ = plane;
+        sketchSessionActive_ = true;
         sketchTool_ = tool;
         hasFirstSketchPoint_ = false;
         setSketchGridVisible(true);
@@ -195,6 +224,7 @@ public:
     void cancelSketchInteraction()
     {
         clearPreview();
+        sketchSessionActive_ = false;
         sketchTool_ = SketchTool::None;
         hasFirstSketchPoint_ = false;
         setSketchGridVisible(false);
@@ -384,6 +414,8 @@ protected:
             sketchTool_ != SketchTool::None) {
             gp_Pnt point;
             if (screenToSketchPlane(lastMousePos_, point)) {
+                point = snappedSketchPoint(point);
+                reportSketchPosition(point);
                 handleSketchClick(point);
             }
             event->accept();
@@ -436,11 +468,19 @@ protected:
         } else if (panning_) {
             const QPoint delta = current - lastMousePos_;
             view_->Pan(delta.x(), -delta.y());
-        } else if (sketchTool_ != SketchTool::None &&
-                   hasFirstSketchPoint_) {
+        } else if (sketchSessionActive_) {
             gp_Pnt point;
             if (screenToSketchPlane(current, point)) {
-                updateSketchPreview(point);
+                point = snappedSketchPoint(point);
+                reportSketchPosition(point);
+
+                if (sketchTool_ != SketchTool::None &&
+                    hasFirstSketchPoint_) {
+                    updateSketchPreview(point);
+                } else if (sketchTool_ == SketchTool::None) {
+                    context_->MoveTo(
+                        current.x(), current.y(), view_, false);
+                }
             }
         } else {
             context_->MoveTo(current.x(), current.y(), view_, false);
@@ -454,7 +494,19 @@ protected:
     void keyPressEvent(QKeyEvent* event) override
     {
         if (event->key() == Qt::Key_Escape) {
-            cancelSketchInteraction();
+            if (sketchSessionActive_) {
+                clearPreview();
+
+                if (hasFirstSketchPoint_) {
+                    hasFirstSketchPoint_ = false;
+                } else {
+                    sketchTool_ = SketchTool::None;
+                }
+
+                event->accept();
+                return;
+            }
+
             if (cancelCallback_) {
                 cancelCallback_();
             }
@@ -552,6 +604,29 @@ private:
         return gp_Dir(0.0, 0.0, 1.0);
     }
 
+    gp_Pnt snappedSketchPoint(const gp_Pnt& point) const
+    {
+        if (!snapEnabled_) {
+            return point;
+        }
+
+        const QPointF uv = toSketchUV(point);
+        const double u =
+            std::round(uv.x() / snapStep_) * snapStep_;
+        const double v =
+            std::round(uv.y() / snapStep_) * snapStep_;
+        return fromSketchUV(u, v);
+    }
+
+    void reportSketchPosition(const gp_Pnt& point)
+    {
+        if (!sketchPositionCallback_) {
+            return;
+        }
+        const QPointF uv = toSketchUV(point);
+        sketchPositionCallback_(uv.x(), uv.y());
+    }
+
     TopoDS_Shape makeSketchShape(
         const gp_Pnt& first,
         const gp_Pnt& second,
@@ -619,7 +694,13 @@ private:
         }
 
         clearPreview();
-        hasFirstSketchPoint_ = false;
+
+        if (sketchTool_ == SketchTool::Line) {
+            firstSketchPoint_ = point;
+            hasFirstSketchPoint_ = true;
+        } else {
+            hasFirstSketchPoint_ = false;
+        }
     }
 
     void updateSketchPreview(const gp_Pnt& point)
@@ -650,10 +731,10 @@ private:
             TopoDS_Compound compound;
             builder.MakeCompound(compound);
 
-            constexpr double extent = 100.0;
-            constexpr double step = 10.0;
+            const double step = snapStep_;
+            const double extent = std::max(100.0, step * 20.0);
 
-            for (int i = -10; i <= 10; ++i) {
+            for (int i = -20; i <= 20; ++i) {
                 const double d = i * step;
                 builder.Add(
                     compound,
@@ -724,7 +805,11 @@ private:
     std::function<void(const Handle(AIS_InteractiveObject)&)> selectionCallback_;
     std::function<void(const TopoDS_Shape&, const QString&)> sketchCommittedCallback_;
     std::function<void()> cancelCallback_;
+    std::function<void(double, double)> sketchPositionCallback_;
 
+    bool sketchSessionActive_ = false;
+    bool snapEnabled_ = true;
+    double snapStep_ = 5.0;
     SketchTool sketchTool_ = SketchTool::None;
     DatumPlane currentSketchPlane_ = DatumPlane::XY;
     gp_Pnt firstSketchPoint_;
@@ -740,7 +825,7 @@ class MainWindow final : public QMainWindow
 public:
     MainWindow()
     {
-        setWindowTitle("MyCAD V0.4 CATIA Foundation");
+        setWindowTitle("MyCAD V0.4.1 Sketcher UX");
         resize(1500, 920);
 
         view_ = new CadView(this);
@@ -764,6 +849,16 @@ public:
         view_->setCancelCallback(
             [this]() {
                 cancelTask(false);
+            });
+        view_->setSketchPositionCallback(
+            [this](double u, double v) {
+                if (sketchCoordLabel_ != nullptr &&
+                    taskKind_ == TaskKind::Sketch) {
+                    sketchCoordLabel_->setText(
+                        QString("U: %1 mm    V: %2 mm")
+                            .arg(u, 0, 'f', 2)
+                            .arg(v, 0, 'f', 2));
+                }
             });
 
         buildModelDock();
@@ -833,9 +928,25 @@ private:
         taskReverse_ =
             new QCheckBox(QString::fromUtf8("反向"), taskPage_);
 
+        sketchCoordLabel_ =
+            new QLabel("U: 0.00 mm    V: 0.00 mm", taskPage_);
+
+        sketchGridSpin_ = new QDoubleSpinBox(taskPage_);
+        sketchGridSpin_->setDecimals(2);
+        sketchGridSpin_->setRange(0.1, 1000.0);
+        sketchGridSpin_->setValue(5.0);
+        sketchGridSpin_->setSuffix(" mm");
+
+        sketchSnapCheck_ =
+            new QCheckBox(QString::fromUtf8("吸附到網格"), taskPage_);
+        sketchSnapCheck_->setChecked(true);
+
         auto* form = new QFormLayout();
         form->addRow(taskValueLabel_, taskValueSpin_);
         form->addRow(QString(), taskReverse_);
+        form->addRow(QString::fromUtf8("游標"), sketchCoordLabel_);
+        form->addRow(QString::fromUtf8("網格"), sketchGridSpin_);
+        form->addRow(QString(), sketchSnapCheck_);
 
         taskApplyButton_ =
             new QPushButton(QString::fromUtf8("套用"), taskPage_);
@@ -862,6 +973,24 @@ private:
             &QCheckBox::toggled,
             this,
             [this](bool) { updateTaskPreview(); });
+        connect(
+            sketchGridSpin_,
+            qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this,
+            [this](double value) {
+                view_->setSketchSnap(
+                    sketchSnapCheck_->isChecked(),
+                    value);
+            });
+        connect(
+            sketchSnapCheck_,
+            &QCheckBox::toggled,
+            this,
+            [this](bool enabled) {
+                view_->setSketchSnap(
+                    enabled,
+                    sketchGridSpin_->value());
+            });
         connect(
             taskApplyButton_,
             &QPushButton::clicked,
@@ -973,12 +1102,37 @@ private:
         connect(redoAct, &QAction::triggered, this, [this]() { redo(); });
         editMenu->addActions({undoAct, redoAct});
 
+        QAction* sketchSelectAct =
+            new QAction(QString::fromUtf8("選取"), this);
+        QAction* sketchFinishAct =
+            new QAction(QString::fromUtf8("完成草圖"), this);
         QAction* sketchRectAct =
             new QAction(QString::fromUtf8("矩形草圖"), this);
         QAction* sketchCircleAct =
             new QAction(QString::fromUtf8("圓形草圖"), this);
         QAction* sketchLineAct =
             new QAction(QString::fromUtf8("直線草圖"), this);
+
+        sketchLineAct->setShortcut(QKeySequence("L"));
+        sketchRectAct->setShortcut(QKeySequence("R"));
+        sketchCircleAct->setShortcut(QKeySequence("C"));
+        sketchFinishAct->setShortcut(QKeySequence("Ctrl+Return"));
+
+        connect(sketchSelectAct, &QAction::triggered, this, [this]() {
+            if (taskKind_ == TaskKind::Sketch) {
+                view_->setSketchTool(SketchTool::None);
+                taskTitleLabel_->setText(
+                    QString::fromUtf8("Sketcher — 選取"));
+                taskHelpLabel_->setText(
+                    QString::fromUtf8(
+                        "目前為選取模式。L=直線、R=矩形、C=圓。"));
+            }
+        });
+        connect(sketchFinishAct, &QAction::triggered, this, [this]() {
+            if (taskKind_ == TaskKind::Sketch) {
+                cancelTask();
+            }
+        });
 
         connect(sketchRectAct, &QAction::triggered, this, [this]() {
             startSketchTask(
@@ -999,8 +1153,20 @@ private:
                 QString::fromUtf8("點兩個端點建立直線。"));
         });
 
-        sketchMenu->addActions({sketchRectAct, sketchCircleAct, sketchLineAct});
-        sketchBar_->addActions({sketchRectAct, sketchCircleAct});
+        sketchMenu->addActions({
+            sketchSelectAct,
+            sketchLineAct,
+            sketchRectAct,
+            sketchCircleAct,
+            sketchFinishAct
+        });
+        sketchBar_->addActions({
+            sketchSelectAct,
+            sketchLineAct,
+            sketchRectAct,
+            sketchCircleAct,
+            sketchFinishAct
+        });
 
         QAction* padAct = new QAction(QString::fromUtf8("凸台 Pad"), this);
         QAction* pocketAct = new QAction(QString::fromUtf8("凹槽 Pocket"), this);
@@ -1171,9 +1337,42 @@ private:
         taskValueLabel_->setVisible(false);
         taskValueSpin_->setVisible(false);
         taskReverse_->setVisible(false);
+        sketchCoordLabel_->setVisible(false);
+        sketchGridSpin_->setVisible(false);
+        sketchSnapCheck_->setVisible(false);
         taskApplyButton_->setVisible(false);
         taskCancelButton_->setVisible(false);
         propertyTabs_->setCurrentWidget(propertyTable_);
+    }
+
+    DatumPlane resolveSketchPlane()
+    {
+        if (taskKind_ == TaskKind::Sketch &&
+            activeSketchPlane_ != DatumPlane::None) {
+            return activeSketchPlane_;
+        }
+
+        DatumPlane plane = selectedDatumPlane();
+        if (plane != DatumPlane::None) {
+            return plane;
+        }
+
+        bool ok = false;
+        const QString choice = QInputDialog::getItem(
+            this,
+            QString::fromUtf8("建立草圖"),
+            QString::fromUtf8("選擇草圖支援面"),
+            {"XY Plane", "YZ Plane", "ZX Plane"},
+            0,
+            false,
+            &ok);
+
+        if (!ok) {
+            return DatumPlane::None;
+        }
+        if (choice == "YZ Plane") return DatumPlane::YZ;
+        if (choice == "ZX Plane") return DatumPlane::ZX;
+        return DatumPlane::XY;
     }
 
     void startSketchTask(
@@ -1181,37 +1380,54 @@ private:
         const QString& title,
         const QString& help)
     {
-        const DatumPlane plane = selectedDatumPlane();
-        if (plane == DatumPlane::None) {
-            QMessageBox::information(
-                this,
-                QString::fromUtf8("建立草圖"),
+        if (taskKind_ == TaskKind::Sketch &&
+            activeSketchPlane_ != DatumPlane::None) {
+            view_->setSketchTool(tool);
+            taskTitleLabel_->setText(
+                title + " — " + datumPlaneName(activeSketchPlane_));
+            taskHelpLabel_->setText(
+                help + "\n" +
                 QString::fromUtf8(
-                    "請先在 Part1 → Body → Origin 選取 XY Plane、YZ Plane 或 ZX Plane。"));
+                    "Esc：取消目前圖元｜完成草圖：離開 Sketcher"));
+            propertyTabs_->setCurrentWidget(taskPage_);
+            return;
+        }
+
+        const DatumPlane plane = resolveSketchPlane();
+        if (plane == DatumPlane::None) {
             return;
         }
 
         cancelTask();
         taskKind_ = TaskKind::Sketch;
+        activeSketchPlane_ = plane;
 
         taskTitleLabel_->setText(
             title + " — " + datumPlaneName(plane));
         taskHelpLabel_->setText(
             help + "\n" +
-            QString::fromUtf8("支援平面：") +
-            datumPlaneName(plane));
+            QString::fromUtf8(
+                "Esc：取消目前圖元｜可直接切換直線 / 矩形 / 圓｜完成草圖才會離開。"));
         taskValueLabel_->setVisible(false);
         taskValueSpin_->setVisible(false);
         taskReverse_->setVisible(false);
-        taskApplyButton_->setText(QString::fromUtf8("完成"));
+        sketchCoordLabel_->setVisible(true);
+        sketchGridSpin_->setVisible(true);
+        sketchSnapCheck_->setVisible(true);
+        taskApplyButton_->setText(QString::fromUtf8("完成草圖"));
         taskApplyButton_->setVisible(true);
         taskCancelButton_->setVisible(true);
 
         propertyTabs_->setCurrentWidget(taskPage_);
+
+        view_->setSketchSnap(
+            sketchSnapCheck_->isChecked(),
+            sketchGridSpin_->value());
         view_->beginSketchTool(tool, plane);
+
         statusBar()->showMessage(
             QString::fromUtf8(
-                "草圖模式：左鍵繪製｜中鍵旋轉｜Shift+中鍵平移｜Esc 離開"));
+                "Sketcher：左鍵繪製｜中鍵旋轉｜Shift+中鍵平移｜Esc 取消目前圖元"));
     }
 
     void startPadTask()
@@ -1243,6 +1459,9 @@ private:
         taskValueSpin_->setValue(20.0);
         taskReverse_->setChecked(false);
         taskReverse_->setVisible(true);
+        sketchCoordLabel_->setVisible(false);
+        sketchGridSpin_->setVisible(false);
+        sketchSnapCheck_->setVisible(false);
         taskApplyButton_->setText(QString::fromUtf8("套用"));
         taskApplyButton_->setVisible(true);
         taskCancelButton_->setVisible(true);
@@ -1303,6 +1522,9 @@ private:
         taskValueSpin_->setValue(20.0);
         taskReverse_->setChecked(false);
         taskReverse_->setVisible(true);
+        sketchCoordLabel_->setVisible(false);
+        sketchGridSpin_->setVisible(false);
+        sketchSnapCheck_->setVisible(false);
         taskApplyButton_->setText(QString::fromUtf8("套用"));
         taskApplyButton_->setVisible(true);
         taskCancelButton_->setVisible(true);
@@ -1439,6 +1661,7 @@ private:
         if (notifyView) {
             view_->cancelSketchInteraction();
         }
+        activeSketchPlane_ = DatumPlane::None;
         showTaskIdle();
         statusBar()->showMessage(
             QString::fromUtf8(
@@ -1568,7 +1791,7 @@ private:
         objects_.clear();
         view_->clearScene();
         objectCounter_ = 0;
-        setWindowTitle("MyCAD V0.4 CATIA Foundation");
+        setWindowTitle("MyCAD V0.4.1 Sketcher UX");
         rebuildTree();
         updateProperties();
     }
@@ -2374,7 +2597,9 @@ private:
         rebuildTree();
 
         if (kind == ObjectKind::Sketch) {
-            view_->viewTop();
+            if (taskKind_ != TaskKind::Sketch) {
+                view_->viewTop();
+            }
         } else {
             view_->fitAll();
         }
@@ -2867,11 +3092,15 @@ private:
     QLabel* taskValueLabel_ = nullptr;
     QDoubleSpinBox* taskValueSpin_ = nullptr;
     QCheckBox* taskReverse_ = nullptr;
+    QLabel* sketchCoordLabel_ = nullptr;
+    QDoubleSpinBox* sketchGridSpin_ = nullptr;
+    QCheckBox* sketchSnapCheck_ = nullptr;
     QPushButton* taskApplyButton_ = nullptr;
     QPushButton* taskCancelButton_ = nullptr;
     QTableWidget* propertyTable_ = nullptr;
 
     TaskKind taskKind_ = TaskKind::None;
+    DatumPlane activeSketchPlane_ = DatumPlane::None;
     int taskPrimaryIndex_ = -1;
     int taskSecondaryIndex_ = -1;
 
@@ -2886,7 +3115,7 @@ int main(int argc, char* argv[])
     QApplication app(argc, argv);
     app.setApplicationName("MyCAD");
     app.setOrganizationName("MyCAD Project");
-    app.setApplicationVersion("0.4.0");
+    app.setApplicationVersion("0.4.1");
 
     MainWindow window;
     window.show();
