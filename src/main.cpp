@@ -6,6 +6,7 @@
 #include <QDoubleSpinBox>
 #include <QFormLayout>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QKeyEvent>
@@ -88,6 +89,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <vector>
 
@@ -825,7 +828,7 @@ class MainWindow final : public QMainWindow
 public:
     MainWindow()
     {
-        setWindowTitle("MyCAD V0.4.1 Sketcher UX");
+        setWindowTitle("MyCAD V0.4.2 Unicode Path Fix");
         resize(1500, 920);
 
         view_ = new CadView(this);
@@ -1791,7 +1794,7 @@ private:
         objects_.clear();
         view_->clearScene();
         objectCounter_ = 0;
-        setWindowTitle("MyCAD V0.4.1 Sketcher UX");
+        setWindowTitle("MyCAD V0.4.2 Unicode Path Fix");
         rebuildTree();
         updateProperties();
     }
@@ -2860,19 +2863,42 @@ private:
             "STEP (*.step *.stp)");
         if (fileName.isEmpty()) return;
 
-        STEPControl_Reader reader;
-        const QByteArray path = fileName.toLocal8Bit();
+        const std::filesystem::path nativePath(
+            fileName.toStdWString());
+        std::ifstream stream(nativePath, std::ios::binary);
 
-        if (reader.ReadFile(path.constData()) != IFSelect_RetDone) {
+        if (!stream.is_open()) {
             QMessageBox::critical(
-                this, QString::fromUtf8("匯入失敗"),
-                QString::fromUtf8("無法讀取 STEP 檔案。"));
+                this,
+                QString::fromUtf8("匯入失敗"),
+                QString::fromUtf8(
+                    "無法開啟 STEP 檔案。\n路徑：") + fileName);
+            return;
+        }
+
+        STEPControl_Reader reader;
+        const QByteArray logicalName =
+            QFileInfo(fileName).fileName().toUtf8();
+
+        if (reader.ReadStream(
+                logicalName.constData(),
+                stream) != IFSelect_RetDone) {
+            QMessageBox::critical(
+                this,
+                QString::fromUtf8("匯入失敗"),
+                QString::fromUtf8(
+                    "STEP 內容無法讀取。\n檔案：") + fileName);
             return;
         }
 
         reader.TransferRoots();
         TopoDS_Shape shape = reader.OneShape();
         if (shape.IsNull()) {
+            QMessageBox::critical(
+                this,
+                QString::fromUtf8("匯入失敗"),
+                QString::fromUtf8(
+                    "STEP 檔案沒有可用幾何。"));
             return;
         }
 
@@ -2892,19 +2918,42 @@ private:
             "IGES (*.iges *.igs)");
         if (fileName.isEmpty()) return;
 
-        IGESControl_Reader reader;
-        const QByteArray path = fileName.toLocal8Bit();
+        const std::filesystem::path nativePath(
+            fileName.toStdWString());
+        std::ifstream stream(nativePath, std::ios::binary);
 
-        if (reader.ReadFile(path.constData()) != IFSelect_RetDone) {
+        if (!stream.is_open()) {
             QMessageBox::critical(
-                this, QString::fromUtf8("匯入失敗"),
-                QString::fromUtf8("無法讀取 IGES 檔案。"));
+                this,
+                QString::fromUtf8("匯入失敗"),
+                QString::fromUtf8(
+                    "無法開啟 IGES 檔案。\n路徑：") + fileName);
+            return;
+        }
+
+        IGESControl_Reader reader;
+        const QByteArray logicalName =
+            QFileInfo(fileName).fileName().toUtf8();
+
+        if (reader.ReadStream(
+                logicalName.constData(),
+                stream) != IFSelect_RetDone) {
+            QMessageBox::critical(
+                this,
+                QString::fromUtf8("匯入失敗"),
+                QString::fromUtf8(
+                    "IGES 內容無法讀取。\n檔案：") + fileName);
             return;
         }
 
         reader.TransferRoots();
         TopoDS_Shape shape = reader.OneShape();
         if (shape.IsNull()) {
+            QMessageBox::critical(
+                this,
+                QString::fromUtf8("匯入失敗"),
+                QString::fromUtf8(
+                    "IGES 檔案沒有可用幾何。"));
             return;
         }
 
@@ -2924,14 +2973,28 @@ private:
             "STL (*.stl)");
         if (fileName.isEmpty()) return;
 
+        const std::filesystem::path nativePath(
+            fileName.toStdWString());
+        std::ifstream stream(nativePath, std::ios::binary);
+
+        if (!stream.is_open()) {
+            QMessageBox::critical(
+                this,
+                QString::fromUtf8("匯入失敗"),
+                QString::fromUtf8(
+                    "無法開啟 STL 檔案。\n路徑：") + fileName);
+            return;
+        }
+
         TopoDS_Shape shape;
         StlAPI_Reader reader;
-        const QByteArray path = fileName.toLocal8Bit();
 
-        if (!reader.Read(shape, path.constData()) || shape.IsNull()) {
+        if (!reader.Read(shape, stream) || shape.IsNull()) {
             QMessageBox::critical(
-                this, QString::fromUtf8("匯入失敗"),
-                QString::fromUtf8("無法讀取 STL 檔案。"));
+                this,
+                QString::fromUtf8("匯入失敗"),
+                QString::fromUtf8(
+                    "STL 內容無法讀取。\n檔案：") + fileName);
             return;
         }
 
@@ -2951,15 +3014,29 @@ private:
             "BREP (*.brep *.brp)");
         if (fileName.isEmpty()) return;
 
+        const std::filesystem::path nativePath(
+            fileName.toStdWString());
+        std::ifstream stream(nativePath, std::ios::binary);
+
+        if (!stream.is_open()) {
+            QMessageBox::critical(
+                this,
+                QString::fromUtf8("匯入失敗"),
+                QString::fromUtf8(
+                    "無法開啟 BREP 檔案。\n路徑：") + fileName);
+            return;
+        }
+
         TopoDS_Shape shape;
         BRep_Builder builder;
-        const QByteArray path = fileName.toLocal8Bit();
+        BRepTools::Read(shape, stream, builder);
 
-        if (!BRepTools::Read(shape, path.constData(), builder) ||
-            shape.IsNull()) {
+        if (shape.IsNull()) {
             QMessageBox::critical(
-                this, QString::fromUtf8("匯入失敗"),
-                QString::fromUtf8("無法讀取 BREP 檔案。"));
+                this,
+                QString::fromUtf8("匯入失敗"),
+                QString::fromUtf8(
+                    "BREP 內容無法讀取。\n檔案：") + fileName);
             return;
         }
 
@@ -2993,9 +3070,17 @@ private:
             return;
         }
 
-        const QByteArray path = fileName.toLocal8Bit();
-        if (writer.Write(path.constData()) != IFSelect_RetDone) {
-            QMessageBox::critical(this, "STEP", QString::fromUtf8("STEP 寫入失敗。"));
+        const std::filesystem::path nativePath(
+            fileName.toStdWString());
+        std::ofstream stream(nativePath, std::ios::binary);
+
+        if (!stream.is_open() ||
+            writer.WriteStream(stream) != IFSelect_RetDone) {
+            QMessageBox::critical(
+                this,
+                "STEP",
+                QString::fromUtf8(
+                    "STEP 寫入失敗。\n路徑：") + fileName);
         }
     }
 
@@ -3018,9 +3103,16 @@ private:
         writer.AddShape(exportShape());
         writer.ComputeModel();
 
-        const QByteArray path = fileName.toLocal8Bit();
-        if (!writer.Write(path.constData())) {
-            QMessageBox::critical(this, "IGES", QString::fromUtf8("IGES 寫入失敗。"));
+        const std::filesystem::path nativePath(
+            fileName.toStdWString());
+        std::ofstream stream(nativePath, std::ios::binary);
+
+        if (!stream.is_open() || !writer.Write(stream)) {
+            QMessageBox::critical(
+                this,
+                "IGES",
+                QString::fromUtf8(
+                    "IGES 寫入失敗。\n路徑：") + fileName);
         }
     }
 
@@ -3039,9 +3131,17 @@ private:
         }
 
         StlAPI_Writer writer;
-        const QByteArray path = fileName.toLocal8Bit();
-        if (!writer.Write(exportShape(), path.constData())) {
-            QMessageBox::critical(this, "STL", QString::fromUtf8("STL 寫入失敗。"));
+        const std::filesystem::path nativePath(
+            fileName.toStdWString());
+        std::ofstream stream(nativePath, std::ios::binary);
+
+        if (!stream.is_open() ||
+            !writer.Write(exportShape(), stream)) {
+            QMessageBox::critical(
+                this,
+                "STL",
+                QString::fromUtf8(
+                    "STL 寫入失敗。\n路徑：") + fileName);
         }
     }
 
@@ -3060,9 +3160,28 @@ private:
             fileName += ".brep";
         }
 
-        const QByteArray path = fileName.toLocal8Bit();
-        if (!BRepTools::Write(exportShape(), path.constData())) {
-            QMessageBox::critical(this, "BREP", QString::fromUtf8("BREP 寫入失敗。"));
+        const std::filesystem::path nativePath(
+            fileName.toStdWString());
+        std::ofstream stream(nativePath, std::ios::binary);
+
+        if (!stream.is_open()) {
+            QMessageBox::critical(
+                this,
+                "BREP",
+                QString::fromUtf8(
+                    "BREP 寫入失敗。\n路徑：") + fileName);
+            return;
+        }
+
+        BRepTools::Write(exportShape(), stream);
+        stream.flush();
+
+        if (!stream.good()) {
+            QMessageBox::critical(
+                this,
+                "BREP",
+                QString::fromUtf8(
+                    "BREP 寫入失敗。\n路徑：") + fileName);
         }
     }
 
@@ -3115,7 +3234,7 @@ int main(int argc, char* argv[])
     QApplication app(argc, argv);
     app.setApplicationName("MyCAD");
     app.setOrganizationName("MyCAD Project");
-    app.setApplicationVersion("0.4.1");
+    app.setApplicationVersion("0.4.2");
 
     MainWindow window;
     window.show();
